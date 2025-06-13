@@ -7,7 +7,7 @@ A modular Python application for real-time person detection and zone-based visit
 The application has been refactored into separate modules for better maintainability and production deployment:
 
 ```
-visitor-counter/
+COUNTER/
 ├── config.py                 # Configuration constants and settings
 ├── zone_counter.py           # Core zone counting logic
 ├── gstreamer_pipeline.py     # GStreamer pipeline management
@@ -17,8 +17,6 @@ visitor-counter/
 ├── main.py                   # Application entry point
 ├── requirements.txt          # Python dependencies
 ├── deploy.sh                 # Deployment script
-├── templates/
-│   └── index3.html          # Web interface template
 ├── static/                   # Static web assets
 ├── logs/                     # Application logs
 └── data/                     # Data storage
