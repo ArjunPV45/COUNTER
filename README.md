@@ -306,3 +306,4 @@ This project is licensed under the MIT License.
 - Hailo AI for hardware acceleration
 - GStreamer community for multimedia framework
 - Flask and SocketIO communities
+# PEOPLE-COUNTER
