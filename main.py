@@ -1,0 +1,119 @@
+import gi
+import logging
+import sys
+import os
+from pathlib import Path
+
+# Ensure GStreamer is properly initialized
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+
+# Initialize GStreamer
+Gst.init(None)
+
+from flask import Flask
+from flask_socketio import SocketIO
+
+# Import custom modules
+from config import SERVER_HOST, SERVER_PORT, DEBUG_MODE, CORS_ALLOWED_ORIGINS, SOCKETIO_ASYNC_MODE
+from zone_counter import MultiSourceZoneVisitorCounter
+from gstreamer_pipeline import PipelineManager
+from video_stream import VideoStreamManager
+from socketio_handlers import register_socketio_handlers
+from web_routes import register_routes
+
+
+def setup_logging():
+    """Setup application logging."""
+    logging.basicConfig(
+        level=logging.INFO if not DEBUG_MODE else logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('visitor_counter.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
+
+
+def create_app():
+    """
+    Create and configure Flask application with all components.
+    
+    Returns:
+        Tuple of (Flask app, SocketIO instance, components dict)
+    """
+    # Create Flask app
+    app = Flask(__name__)
+    app.config['SECRET_KEY'] = 'your-secret-key-here'  # Change in production
+    
+    # Initialize SocketIO
+    socketio = SocketIO(
+        app, 
+        cors_allowed_origins=CORS_ALLOWED_ORIGINS,
+        async_mode=SOCKETIO_ASYNC_MODE
+    )
+    
+    # Initialize core components
+    user_data = MultiSourceZoneVisitorCounter()
+    frame_buffers = {}  # Global frame buffer for all camera sources
+    
+    # Initialize managers
+    pipeline_manager = PipelineManager(user_data, frame_buffers, socketio)
+    video_stream_manager = VideoStreamManager(frame_buffers, user_data)
+    
+    # Register SocketIO handlers
+    register_socketio_handlers(socketio, user_data)
+    
+    # Register web routes
+    register_routes(app, user_data, pipeline_manager, video_stream_manager)
+    
+    components = {
+        'user_data': user_data,
+        'frame_buffers': frame_buffers,
+        'pipeline_manager': pipeline_manager,
+        'video_stream_manager': video_stream_manager
+    }
+    
+    return app, socketio, components
+
+
+def main():
+    """Main application entry point."""
+    logger = setup_logging()
+    logger.info("Starting Multi-Source Zone Visitor Counter Application")
+    
+    try:
+        # Create application
+        app, socketio, components = create_app()
+        
+        logger.info(f"Application created successfully")
+        logger.info(f"Available cameras: {list(components['user_data'].data.keys())}")
+        logger.info(f"Active camera: {components['user_data'].active_camera}")
+        
+        # Start the server
+        logger.info(f"Starting server on {SERVER_HOST}:{SERVER_PORT}")
+        socketio.run(
+            app, 
+            host=SERVER_HOST, 
+            port=SERVER_PORT, 
+            debug=DEBUG_MODE,
+            allow_unsafe_werkzeug=True  # For development only
+        )
+        
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user")
+    except Exception as e:
+        logger.error(f"Application failed to start: {e}", exc_info=True)
+        return 1
+    finally:
+        # Cleanup
+        logger.info("Shutting down application")
+        if 'components' in locals() and components['pipeline_manager']:
+            components['pipeline_manager'].stop_pipeline()
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
