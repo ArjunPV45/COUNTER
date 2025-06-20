@@ -1,13 +1,38 @@
 import os
+import subprocess
+import json
+
+
+def detect_rtsp_codec(rtsp_url):
+    """Detect video codec using ffprobe"""
+    cmd = [
+        'ffprobe',
+        '-v', 'quiet',
+        '-print_format', 'json',
+        '-show_streams',
+        '-show_format',
+        '-rtsp_transport', 'tcp',
+        rtsp_url
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            video_streams = [s for s in data.get('streams', []) if s.get('codec_type') == 'video']
+            if video_streams:
+                codec = video_streams[0].get('codec_name', '').lower()
+                return codec
+    except Exception as e:
+        print(f"[WARN] ffprobe failed for {rtsp_url}: {e}")
+    return None
+
 
 def get_source_type(input_source):
-    # This function will return the source type based on the input source
-    # return values can be "file", "mipi" or "usb"
     if input_source.startswith("/dev/video"):
         return 'usb'
     elif input_source.startswith("rpi"):
         return 'rpi'
-    elif input_source.startswith("libcamera"): # Use libcamerasrc element, not suggested
+    elif input_source.startswith("libcamera"):
         return 'libcamera'
     elif input_source.startswith('0x'):
         return 'ximage'
@@ -16,27 +41,12 @@ def get_source_type(input_source):
     else:
         return 'file'
 
+
 def QUEUE(name, max_size_buffers=3, max_size_bytes=0, max_size_time=0, leaky='no'):
-    """
-    Creates a GStreamer queue element string with the specified parameters.
+    return f'queue name={name} leaky={leaky} max-size-buffers={max_size_buffers} max-size-bytes={max_size_bytes} max-size-time={max_size_time} '
 
-    Args:
-        name (str): The name of the queue element.
-        max_size_buffers (int, optional): The maximum number of buffers that the queue can hold. Defaults to 3.
-        max_size_bytes (int, optional): The maximum size in bytes that the queue can hold. Defaults to 0 (unlimited).
-        max_size_time (int, optional): The maximum size in time that the queue can hold. Defaults to 0 (unlimited).
-        leaky (str, optional): The leaky type of the queue. Can be 'no', 'upstream', or 'downstream'. Defaults to 'no'.
-
-    Returns:
-        str: A string representing the GStreamer queue element with the specified parameters.
-    """
-    q_string = f'queue name={name} leaky={leaky} max-size-buffers={max_size_buffers} max-size-bytes={max_size_bytes} max-size-time={max_size_time} '
-    return q_string
 
 def get_camera_resolotion(video_width=640, video_height=640):
-    # This function will return a standard camera resolution based on the video resolution required
-    # Standard resolutions are 640x480, 1280x720, 1920x1080, 3840x2160
-    # If the required resolution is not standard, it will return the closest standard resolution
     if video_width <= 640 and video_height <= 480:
         return 640, 480
     elif video_width <= 1280 and video_height <= 720:
@@ -47,22 +57,37 @@ def get_camera_resolotion(video_width=640, video_height=640):
         return 3840, 2160
 
 
+def get_rtsp_codec_pipeline(video_source, name_with_index, codec_type=None):
+    codec_type = codec_type.lower() if codec_type else 'h264'
+    if codec_type in ['h264', 'avc1']:
+        return (
+            f"rtspsrc location={video_source} name={name_with_index} latency=200 buffer-mode=1 "
+            f"drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
+            f"rtph264depay ! h264parse ! avdec_h264 ! "
+            f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
+            f"video/x-raw, format=I420 ! "
+        )
+    elif codec_type in ['hevc', 'h265']:
+        return (
+            f"rtspsrc location={video_source} name={name_with_index} latency=200 buffer-mode=1 "
+            f"drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
+            f"rtph265depay ! h265parse ! avdec_h265 ! "
+            f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
+            f"video/x-raw, format=I420 ! "
+        )
+    else:
+        print(f"[WARN] Unknown codec '{codec_type}', defaulting to H264.")
+        return (
+            f"rtspsrc location={video_source} name={name_with_index} latency=200 buffer-mode=1 "
+            f"drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
+            f"rtph264depay ! h264parse ! avdec_h264 ! "
+            f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
+            f"video/x-raw, format=I420 ! "
+        )
+
+
 def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_format='RGB', name='source', no_webcam_compression=False, source_index=None):
-    """
-    Creates a GStreamer pipeline string for the video source.
-
-    Args:
-        video_source (str): The path or device name of the video source.
-        video_width (int, optional): The width of the video. Defaults to 640.
-        video_height (int, optional): The height of the video. Defaults to 640.
-        video_format (str, optional): The video format. Defaults to 'RGB'.
-        name (str, optional): The prefix name for the pipeline elements. Defaults to 'source'.
-
-    Returns:
-        str: A string representing the GStreamer pipeline for the video source.
-    """
     source_type = get_source_type(video_source)
-
     if source_index is not None:
         unique_suffix = f"_{source_index}"
         name_with_index = f"{name}{unique_suffix}"
@@ -70,18 +95,14 @@ def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_forma
         unique_suffix = ""
         name_with_index = name
 
-    
-
     if source_type == 'usb':
         if no_webcam_compression:
-            # When using uncomressed format, only low resolution is supported
             source_element = (
                 f'v4l2src device={video_source} name={name_with_index} ! '
                 f'video/x-raw, format=RGB, width=640, height=480 ! '
-                'videoflip name=videoflip{unique_suffix} video-direction=horiz ! '
+                f'videoflip name=videoflip{unique_suffix} video-direction=horiz ! '
             )
         else:
-            # Use compressed format for webcam
             width, height = get_camera_resolotion(video_width, video_height)
             source_element = (
                 f'v4l2src device={video_source} name={name_with_index} ! image/jpeg, framerate=30/1, width={width}, height={height} ! '
@@ -92,20 +113,13 @@ def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_forma
     elif source_type == 'rpi':
         source_element = (
             f'appsrc name=app_source{unique_suffix} is-live=true leaky-type=downstream max-buffers=3 ! '
-            'videoflip name=videoflip{unique_suffix} video-direction=horiz ! '
+            f'videoflip name=videoflip{unique_suffix} video-direction=horiz ! '
             f'video/x-raw, format={video_format}, width={video_width}, height={video_height} ! '
         )
-        
     elif source_type == "rtsp":
-        source_element = (
-            f"rtspsrc location={video_source} name={name_with_index} "
-            f"latency=200 buffer-mode=1 drop-on-latency=true is-live=true "
-            f"udp-buffer-size=524288 protocols=udp ! "
-            f"rtph264depay ! h264parse ! avdec_h264 ! "
-            f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
-            f"video/x-raw, format=I420 ! "
-        ) 
-        
+        codec_type = detect_rtsp_codec(video_source)
+        print(f"[INFO] Detected codec for {video_source}: {codec_type}")
+        source_element = get_rtsp_codec_pipeline(video_source, name_with_index, codec_type)
     elif source_type == 'libcamera':
         source_element = (
             f'libcamerasrc name={name_with_index} ! '
@@ -119,12 +133,13 @@ def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_forma
         )
     else:
         source_element = (
-            f"rtspsrc location={video_source} name={name}  message-forward=true ! "
+            f"rtspsrc location={video_source} name={name} message-forward=true ! "
             f"rtph264depay !"
             f"queue name=hailo_preprocess_q_0 leaky=no max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             f"decodebin ! queue leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            " video/x-raw, format=I420 ! "
+            f"video/x-raw, format=I420 ! "
         )
+
     source_pipeline = (
         f'{source_element} '
         f'{QUEUE(name=f"{name_with_index}_scale_q")} ! '
@@ -133,8 +148,8 @@ def SOURCE_PIPELINE(video_source, video_width=640, video_height=640, video_forma
         f'videoconvert n-threads=3 name={name_with_index}_convert qos=false ! '
         f'video/x-raw, pixel-aspect-ratio=1/1, format={video_format}, width={video_width}, height={video_height} '
     )
-
     return source_pipeline
+
 
 def INFERENCE_PIPELINE(
     hef_path,
