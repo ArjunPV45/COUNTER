@@ -7,7 +7,7 @@ import os
 
 # Model configurations
 MODEL_PATHS = {
-    "yolov6n": "/home/raspberry5/hailo-rpi5-examples/resources/yolov8s_h8l.hef",
+    "yolov8s": "../resources/yolov8s_h8l.hef",
 }
 
 # File paths
