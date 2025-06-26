@@ -1,0 +1,22 @@
+[Unit]
+Description=Python Project Service
+After=network-online.target graphical-session.target
+Wants=network-online.target graphical-session.target
+Requires=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/counter
+ExecStart=/bin/bash -c 'source /home/pi/counter/setup_env.sh && python3 main.py'
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+
+[Install]
+WantedBy=multi-user.target
