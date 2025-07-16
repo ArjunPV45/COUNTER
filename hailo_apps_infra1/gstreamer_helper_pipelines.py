@@ -62,7 +62,7 @@ def get_rtsp_codec_pipeline(video_source, name_with_index, codec_type=None):
     if codec_type in ['h264', 'avc1']:
         return (
             f"rtspsrc location={video_source} name={name_with_index} latency=200 buffer-mode=1 "
-            f"drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
+            f"timeout=10000000 drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
             f"rtph264depay ! h264parse ! avdec_h264 ! "
             f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
             f"video/x-raw, format=I420 ! "
@@ -70,7 +70,7 @@ def get_rtsp_codec_pipeline(video_source, name_with_index, codec_type=None):
     elif codec_type in ['hevc', 'h265']:
         return (
             f"rtspsrc location={video_source} name={name_with_index} latency=200 buffer-mode=1 "
-            f"drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
+            f"timeout=10000000 drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
             f"rtph265depay ! h265parse ! avdec_h265 ! "
             f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
             f"video/x-raw, format=I420 ! "
@@ -79,7 +79,7 @@ def get_rtsp_codec_pipeline(video_source, name_with_index, codec_type=None):
         print(f"[WARN] Unknown codec '{codec_type}', defaulting to H264.")
         return (
             f"rtspsrc location={video_source} name={name_with_index} latency=200 buffer-mode=1 "
-            f"drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
+            f"timeout=10000000 drop-on-latency=true is-live=true udp-buffer-size=524288 protocols=udp ! "
             f"rtph264depay ! h264parse ! avdec_h264 ! "
             f"{QUEUE(name=f'{name_with_index}_queue', max_size_buffers=5, leaky='downstream')} ! "
             f"video/x-raw, format=I420 ! "
@@ -349,7 +349,7 @@ def USER_CALLBACK_PIPELINE(name='identity_callback'):
 
     return user_callback_pipeline
 
-def TRACKER_PIPELINE(class_id, kalman_dist_thr=0.8, iou_thr=0.9, init_iou_thr=0.7, keep_new_frames=3, keep_tracked_frames=15, keep_lost_frames=2, keep_past_metadata=False, qos=False, name='hailo_tracker'):
+def TRACKER_PIPELINE(class_id, kalman_dist_thr=0.7, iou_thr=0.85, init_iou_thr=0.6, keep_new_frames=3, keep_tracked_frames=45, keep_lost_frames=20, keep_past_metadata=True, qos=False, name='hailo_tracker'):
     """
     Creates a GStreamer pipeline string for the HailoTracker element.
     Args:
@@ -426,3 +426,12 @@ def CROPPER_PIPELINE(
         # aggregator output
         f'{name}_agg. ! {QUEUE(name=f"{name}_output_q")} '
     )
+
+def CROP_PIPELINE(so_path, function_name="crop_person_by_id", config_json=None, name="cropper", output_path="/tmp/crop_%05d.jpg"):
+    config_str = f' config-path={config_json} ' if config_json else ''
+    return (
+        f'{QUEUE(name=f"{name}_q")} ! '
+        f'hailofilter name={name} so-path={so_path} function-name={function_name}{config_str} qos=false ! '
+        f'jpegenc ! multifilesink location={output_path} '
+    ) 
+

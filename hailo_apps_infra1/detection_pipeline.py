@@ -21,6 +21,8 @@ from hailo_apps_infra1.gstreamer_helper_pipelines import(
     TRACKER_PIPELINE,
     USER_CALLBACK_PIPELINE,
     DISPLAY_PIPELINE,
+    CROP_PIPELINE,
+    
 )
 from hailo_apps_infra1.gstreamer_app import (
     GStreamerApp,
@@ -49,8 +51,8 @@ class GStreamerDetectionApp(GStreamerApp):
         # Additional initialization code can be added here
         # Set Hailo parameters these parameters should be set based on the model used
         self.batch_size = 2
-        nms_score_threshold = 0.4
-        nms_iou_threshold = 0.45
+        nms_score_threshold = 0.3
+        nms_iou_threshold = 0.2
 
 
         # Determine the architecture if not specified
@@ -124,8 +126,8 @@ class GStreamerMultiSourceDetectionApp(GStreamerApp):
             help="Path to costom labels JSON file",
         )
         args = parser.parse_args()
-        nms_score_threshold = 0.3
-        nms_iou_threshold = 0.45
+        nms_score_threshold = 0.4
+        nms_iou_threshold = 0.5
 
         super().__init__(args, user_data)
         self.video_sources = video_sources  # Multiple RTSP sources
@@ -171,6 +173,7 @@ class GStreamerMultiSourceDetectionApp(GStreamerApp):
     def get_pipeline_string(self):
         source_pipelines = []
         compositor_elements = []
+        cropper_so_path = os.path.join(self.current_path, '../resources/libdetection_croppers.so')
         
         num_sources = len(self.video_sources)
         screen_width = 1280 if num_sources <= 2 else 1920
@@ -189,7 +192,13 @@ class GStreamerMultiSourceDetectionApp(GStreamerApp):
                 name=f"infer_{i}") # ✅ Unique name per source
             
             detection_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(detection_pipeline, name=f"inference_wrapper_{i}")
-            tracker_pipeline = TRACKER_PIPELINE(class_id=1, name=f"tracker_{i}")  # ✅ Unique tracker per source
+            tracker_pipeline = TRACKER_PIPELINE(class_id=1, keep_past_metadata=True, name=f"tracker_{i}")  # ✅ Unique tracker per source
+            cropper_pipeline = CROP_PIPELINE(
+                so_path=cropper_so_path,
+                function_name="all_detections",
+                name=f"cropper_{i}",
+                output_path=f"/tmp/crop_{i}_%05d.jpg"
+            )
             if i == 0:
                 identity_name = "identity_callback"
                 display_name = "hailo_display"
@@ -201,6 +210,10 @@ class GStreamerMultiSourceDetectionApp(GStreamerApp):
             user_callback_pipeline = USER_CALLBACK_PIPELINE(name=identity_name)
             display_pipeline = DISPLAY_PIPELINE(video_sink=self.video_sink, sync=self.sync, show_fps=self.show_fps, name=display_name)
             
+            enhancement_pipeline = (
+                f'{QUEUE(name=f"enhance_{i}_q")} ! '
+                f'videoconvert name=enhance_{i}_convert ! '
+            )
             
             #user_callback_pipeline = USER_CALLBACK_PIPELINE(name=f"identity_callback_{i}")
             '''(
@@ -214,7 +227,16 @@ class GStreamerMultiSourceDetectionApp(GStreamerApp):
             compositor_elements.append(f"sink_{i}::xpos={xpos} sink_{i}::ypos={ypos}")
 
             # Ensure unique queue names per pipeline
-            full_pipeline = f"{source_pipeline} ! {detection_pipeline_wrapper} ! {tracker_pipeline} ! {user_callback_pipeline} ! {display_pipeline} "#! comp.sink_{i} "
+            full_pipeline = (
+                f"{source_pipeline} ! "
+                f"{detection_pipeline_wrapper} ! "
+                f"{tracker_pipeline} ! "
+                f"{user_callback_pipeline} ! {display_pipeline}"
+            )
+
+            
+            
+            #full_pipeline = f"{source_pipeline} ! {detection_pipeline_wrapper} ! {tracker_pipeline} ! {cropper_pipeline} ! {user_callback_pipeline} ! {display_pipeline} "#! comp.sink_{i} "
             '''full_pipeline = (
                 f'{source_pipeline} ! '
                 f'queue name=q_infer leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! '
@@ -255,9 +277,5 @@ if __name__ == "__main__":
     app = GStreamerDetectionApp(app_callback, user_data)
     app.run()'''
     
-'''f"{source_pipeline} ! " # queue name=q_src_{i} leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! "
-                f"{detection_pipeline} ! queue name=q_detect_{i} leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! "
-                #f"{tracker_pipeline} ! queue name=q_track_{i} leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! "
-                #f"{user_callback_pipeline} ! queue name=q_callback_{i} leaky=no max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! "
-                f"comp.sink_{i} " '''    
+   
 

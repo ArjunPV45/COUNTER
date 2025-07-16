@@ -2,7 +2,9 @@ import gi
 import logging
 import sys
 import os
+import signal
 from pathlib import Path
+import json
 
 # Ensure GStreamer is properly initialized
 gi.require_version('Gst', '1.0')
@@ -15,13 +17,31 @@ from flask import Flask
 from flask_socketio import SocketIO
 
 # Import custom modules
-from config import SERVER_HOST, SERVER_PORT, DEBUG_MODE, CORS_ALLOWED_ORIGINS, SOCKETIO_ASYNC_MODE
+from config import SERVER_HOST, SERVER_PORT, DEBUG_MODE, CORS_ALLOWED_ORIGINS, SOCKETIO_ASYNC_MODE, load_config, get_active_sources
 from zone_counter import MultiSourceZoneVisitorCounter
 from gstreamer_pipeline import PipelineManager
 from video_stream import VideoStreamManager
 from socketio_handlers import register_socketio_handlers
 from web_routes import register_routes
 
+
+# Global components for cleanup
+components = None
+app_instance = None
+socketio_instance = None
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Received signal {signum}, shutting down...")
+    
+    if components and components.get('pipeline_manager'):
+        try:
+            components['pipeline_manager'].stop_pipeline()
+        except Exception as e:
+            logger.error(f"Error stopping pipeline: {e}")
+    
+    sys.exit(0)
 
 def setup_logging():
     """Setup application logging."""
@@ -50,7 +70,7 @@ def create_app():
     # Initialize SocketIO
     socketio = SocketIO(
         app, 
-        cors_allowed_origins=CORS_ALLOWED_ORIGINS,
+        cors_allowed_origins="*",  # CORS_ALLOWED_ORIGINS,
         async_mode=SOCKETIO_ASYNC_MODE
     )
     
@@ -61,6 +81,15 @@ def create_app():
     # Initialize managers
     pipeline_manager = PipelineManager(user_data, frame_buffers, socketio)
     video_stream_manager = VideoStreamManager(frame_buffers, user_data)
+    
+    try:
+        config = load_config()
+        active_sources = config.get("video_sources", [])
+        if active_sources:
+            logging.info(f"Loaded active video sources from config: {active_sources}")
+            pipeline_manager.start_pipeline(active_sources)
+    except Exception as e:
+        logging.warning(f"Failed to load config or start pipeline: {e}")
     
     # Register SocketIO handlers
     register_socketio_handlers(socketio, user_data)
@@ -80,12 +109,18 @@ def create_app():
 
 def main():
     """Main application entry point."""
+    global components, app_instance, socketio_instance
+    
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     logger = setup_logging()
     logger.info("Starting Multi-Source Zone Visitor Counter Application")
     
     try:
         # Create application
-        app, socketio, components = create_app()
+        app_instance, socketio_instance, components = create_app()
         
         logger.info(f"Application created successfully")
         logger.info(f"Available cameras: {list(components['user_data'].data.keys())}")
@@ -93,8 +128,8 @@ def main():
         
         # Start the server
         logger.info(f"Starting server on {SERVER_HOST}:{SERVER_PORT}")
-        socketio.run(
-            app, 
+        socketio_instance.run(
+            app_instance, 
             host=SERVER_HOST, 
             port=SERVER_PORT, 
             debug=DEBUG_MODE,
@@ -109,11 +144,19 @@ def main():
     finally:
         # Cleanup
         logger.info("Shutting down application")
-        if 'components' in locals() and components['pipeline_manager']:
-            components['pipeline_manager'].stop_pipeline()
+        if components and components.get('pipeline_manager'):
+            try:
+                components['pipeline_manager'].stop_pipeline()
+            except Exception as e:
+                logger.error(f"Error during pipeline cleanup: {e}")
     
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except Exception as e:
+        logging.error(f"Unhandled fatal error in main: {e}", exc_info=True)
+        sys.exit(1)

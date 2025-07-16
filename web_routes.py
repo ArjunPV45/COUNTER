@@ -1,9 +1,10 @@
 from flask import Flask, render_template, jsonify, request, Response
 from video_stream import VideoStreamManager
-from config import TEMPLATE_FILE
+from config import TEMPLATE_FILE, load_config, save_active_sources
 
 
-def register_routes(app: Flask, user_data, pipeline_manager, video_stream_manager: VideoStreamManager):
+
+def register_routes(app: Flask, user_data, pipeline_manager, video_stream_manager):
     """
     Register all Flask routes.
 
@@ -33,6 +34,9 @@ def register_routes(app: Flask, user_data, pipeline_manager, video_stream_manage
         try:
             success = pipeline_manager.start_pipeline(video_sources)
             if success:
+                config = load_config()
+                config["video_sources"] = video_sources
+                save_active_sources(video_sources)
                 return jsonify({"success": True, "message": "Pipeline started with validated sources"}), 200
             else:
                 return jsonify({"success": False, "message": "Failed to start pipeline - check RTSP sources"}), 400
@@ -101,6 +105,17 @@ def register_routes(app: Flask, user_data, pipeline_manager, video_stream_manage
             "camera_id": camera_id,
             "zones": user_data.data[camera_id]["zones"]
         })
+
+        success = user_data.create_or_update_zone(camera_id, zone, top_left, bottom_right)
+
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Zone '{zone}' created/updated for camera {camera_id}",
+                "zone_data": user_data.data[camera_id]["zones"][zone]
+            }), 201
+        else:
+            return jsonify({"error": "Invalid zone coordinates"}), 400
 
     @app.route("/api/camera/<camera_id>/zones", methods=["POST"])
     def create_camera_zone(camera_id):

@@ -87,7 +87,8 @@ def register_socketio_handlers(socketio: SocketIO, user_data):
         if success:
             emit("camera_changed", {
                 "active_camera": user_data.active_camera,
-                "data": user_data.data
+                "data": user_data.data,
+                "cameras": list(user_data.data.keys())
             })
         else:
             emit("error", {"message": f"Camera {camera_id} not found"})
@@ -118,7 +119,8 @@ def register_socketio_handlers(socketio: SocketIO, user_data):
         print("Client connected")
         emit("initial_data", {
             "data": user_data.data,
-            "active_camera": user_data.active_camera
+            "active_camera": user_data.active_camera,
+            "cameras": list(user_data.data.keys())
         })
 
     @socketio.on("disconnect")

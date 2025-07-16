@@ -72,8 +72,8 @@ function loadCameras() {
     fetch('/get_cameras')
         .then(response => response.json())
         .then(data => {
-            const cameraSelector = document.getElementById('camera-selector');
-            cameraSelector.innerHTML = '';
+            const cameraButtonsDiv = document.getElementById('camera-buttons');
+            cameraButtonsDiv.innerHTML = '';
             data.cameras.forEach(camera => {
                 const button = document.createElement('button');
                 button.setAttribute('data-camera', camera);
@@ -83,7 +83,7 @@ function loadCameras() {
                     currentCamera = camera;
                 }
                 button.addEventListener('click', () => switchCamera(camera));
-                cameraSelector.appendChild(button);
+                cameraButtonsDiv.appendChild(button);
             });
         })
         .catch(error => {
