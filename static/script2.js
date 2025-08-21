@@ -3,9 +3,11 @@ const socket = io();
 
 // State management
 let selectedZone = null;
+let selectedLine = null;
 let isDrawing = false;
 let startPoint = null;
 let zones = {};
+let lines = {};
 let currentCamera = "camera1"; // Default active camera
 
 // Zone colors with transparency
@@ -16,6 +18,8 @@ const zoneColors = {
     zone4: 'rgba(255, 165, 0, 0.3)', // Orange
     zone5: 'rgba(165, 180, 0, 0.3)'
 };
+
+const lineColor = 'rgba(94, 255, 0, 0.9)'; // Semi-transparent black for lines
 
 // Initialize canvas and video elements
 const videoFeed = document.getElementById("video-feed");
@@ -29,6 +33,37 @@ const snapshotCtx = snapshotOverlay.getContext("2d");
 const ORIGINAL_VIDEO_WIDTH = 1920;
 const ORIGINAL_VIDEO_HEIGHT = 1080;
 
+function drawAllLines(context, width, height) {
+    if (!lines[currentCamera]) return;
+    for (const [lineName, lineData] of Object.entries(lines[currentCamera])) {
+        const start = lineData.start;
+        const end = lineData.end;
+
+        const scaledStart = [
+            (start[0] / ORIGINAL_VIDEO_WIDTH) * width,
+            (start[1] / ORIGINAL_VIDEO_HEIGHT) * height
+        ];
+        const scaledEnd = [
+            (end[0] / ORIGINAL_VIDEO_WIDTH) * width,
+            (end[1] / ORIGINAL_VIDEO_HEIGHT) * height
+        ];
+
+        context.strokeStyle = lineColor;
+        context.lineWidth = 3;
+        context.beginPath();
+        context.moveTo(scaledStart[0], scaledStart[1]);
+        context.lineTo(scaledEnd[0], scaledEnd[1]);
+        context.stroke();
+
+        context.fillStyle = 'black';
+        context.font = '14px Arial';
+        context.fillText(lineName, scaledStart[0] + 5, scaledStart[1] - 5);
+    }
+}
+
+
+
+
 // Setup canvas dimensions - using fixed size similar to script1.js
 function setupCanvas() {
     // Set fixed width/height ratio but scale to fit the container
@@ -41,9 +76,32 @@ function setupCanvas() {
 }
 
 function setupSnapshotCanvas() {
+    const imageElement = document.getElementById('snapshot-image');
+    
+    // Wait for image to load completely
+    if (!imageElement.complete || imageElement.naturalWidth === 0) {
+        imageElement.addEventListener('load', setupSnapshotCanvas, { once: true });
+        return;
+    }
+    
+    // CRITICAL FIX: Match canvas dimensions to displayed image size
+    const imageRect = imageElement.getBoundingClientRect();
+    
+    snapshotOverlay.width = imageRect.width;   // Change from 1920
+    snapshotOverlay.height = imageRect.height; // Change from 1080
+    
+    // Ensure canvas is positioned correctly over image
+    snapshotOverlay.style.left = '0px';
+    snapshotOverlay.style.top = '0px';
+    
+    console.log('Canvas setup - Fixed dimensions:', {
+        canvasSize: [snapshotOverlay.width, snapshotOverlay.height],
+        imageDisplaySize: [imageRect.width, imageRect.height],
+        imageNaturalSize: [imageElement.naturalWidth, imageElement.naturalHeight]
+    });
     // For snapshot, match the image dimensions exactly
-    snapshotOverlay.width = 1920; //snapshotImage.width;
-    snapshotOverlay.height = 1080; //snapshotImage.height;
+    //snapshotOverlay.width = 1920; snapshotImage.width;
+    //snapshotOverlay.height = 1080; snapshotImage.height;
 }
 
 // Initialize on load
@@ -95,8 +153,16 @@ function loadCameras() {
 function switchCamera(cameraId) {
     socket.emit('set_active_camera', { camera_id: cameraId });
     
+    // Force browser to reload the image
+    videoFeed.src = '';  // Clear first
+    setTimeout(() => {
+        videoFeed.src = `/video_feed?camera_id=${cameraId}`;
+    }, 100);
+    
+    currentCamera = cameraId;
+
     // Update active button
-    const buttons = document.querySelectorAll('#camera-selector button');
+    const buttons = document.querySelectorAll('#camera-buttons button');
     buttons.forEach(button => {
         button.classList.remove('active');
         if (button.getAttribute('data-camera') === cameraId) {
@@ -105,11 +171,15 @@ function switchCamera(cameraId) {
     });
     
     // Update video feed source
-    videoFeed.src = `/video_feed?camera_id=${cameraId}`;
-    currentCamera = cameraId;
+    //videoFeed.src = `/video_feed?camera_id=${cameraId}`;
+    //currentCamera = cameraId;
     
     // Clear and redraw zones
     loadZones();
+    loadLines();
+    updateZoneBoxes();
+    updateLineBoxesVisibility();
+    updateLineCounts();
 }
 
 // Load zones from server
@@ -130,28 +200,21 @@ function loadZones() {
 // Draw all zones on canvas
 function drawAllZones(context, width, height) {
     context.clearRect(0, 0, width, height);
-    
     if (!zones[currentCamera]) return;
-    
+
     const cameraZones = zones[currentCamera].zones;
     for (const [zoneName, zoneData] of Object.entries(cameraZones)) {
         const tl = zoneData.top_left;
         const br = zoneData.bottom_right;
-        
-        // Scale points to canvas dimensions
-        const scaledTL = [
-            (tl[0] / ORIGINAL_VIDEO_WIDTH) * width,
-            (tl[1] / ORIGINAL_VIDEO_HEIGHT) * height
-        ];
-        
-        const scaledBR = [
-            (br[0] / ORIGINAL_VIDEO_WIDTH) * width,
-            (br[1] / ORIGINAL_VIDEO_HEIGHT) * height
-        ];
-        
+        const scaledTL = [ (tl[0] / ORIGINAL_VIDEO_WIDTH) * width, (tl[1] / ORIGINAL_VIDEO_HEIGHT) * height ];
+        const scaledBR = [ (br[0] / ORIGINAL_VIDEO_WIDTH) * width, (br[1] / ORIGINAL_VIDEO_HEIGHT) * height ];
         drawZone(context, zoneName, scaledTL, scaledBR);
     }
+    drawAllLines(context, width, height);
 }
+
+
+
 
 // Draw single zone
 function drawZone(context, zoneName, topLeft, bottomRight) {
@@ -172,43 +235,121 @@ function drawZone(context, zoneName, topLeft, bottomRight) {
 
 // Update zone boxes in the UI
 function updateZoneBoxes() {
-    // Hide all zone boxes first
-    document.querySelectorAll('.zone-box').forEach(box => {
-        box.classList.add('hidden');
-    });
-    
-    if (!zones[currentCamera]) return;
-    
+    document.querySelectorAll('#zone-monitoring-container .zone-box').forEach(box => box.classList.add('hidden'));
+    if (!zones[currentCamera] || !zones[currentCamera].zones) return;
+
     const cameraZones = zones[currentCamera].zones;
     for (const [zoneName, zoneData] of Object.entries(cameraZones)) {
         const zoneBox = document.getElementById(`${zoneName}-box`);
-        if (zoneBox) {
-            zoneBox.classList.remove('hidden');
-            
-            // Update counts
-            document.getElementById(`${zoneName}_in`).textContent = zoneData.in_count;
-            document.getElementById(`${zoneName}_out`).textContent = zoneData.out_count;
-            
-            // Update people inside
-            const insideList = document.getElementById(`${zoneName}_inside_ids`);
-            insideList.innerHTML = '';
-            
-            if (zoneData.inside_ids && zoneData.inside_ids.length > 0) {
-                zoneBox.classList.add('occupied');
-                zoneData.inside_ids.forEach(id => {
-                    const li = document.createElement('li');
-                    li.textContent = `Person ID: ${id}`;
-                    insideList.appendChild(li);
-                });
-            } else {
-                zoneBox.classList.remove('occupied');
+        if (!zoneBox) continue;
+        zoneBox.classList.remove('hidden');
+        document.getElementById(`${zoneName}_in`).textContent = zoneData.in_count;
+        document.getElementById(`${zoneName}_out`).textContent = zoneData.out_count;
+
+        const insideList = document.getElementById(`${zoneName}_inside_ids`);
+        insideList.innerHTML = '';
+        if (zoneData.inside_ids?.length > 0) {
+            zoneBox.classList.add('occupied');
+            zoneData.inside_ids.forEach(id => {
                 const li = document.createElement('li');
-                li.textContent = 'No one inside';
+                li.textContent = `Person ID: ${id}`;
                 insideList.appendChild(li);
+            });
+        } else {
+            zoneBox.classList.remove('occupied');
+            const li = document.createElement('li');
+            li.textContent = 'No one inside';
+            insideList.appendChild(li);
+        }
+    }
+    updateLineCounts();
+}
+
+
+// Add this new function
+function updateLineBoxesVisibility() {
+    // First, ensure all line boxes are hidden
+    document.querySelectorAll('#line-monitoring-container .line-box').forEach(box => box.classList.add('hidden'));
+
+    // Check if there is line data for the current camera
+    if (lines[currentCamera]) {
+        // Loop through the defined lines for this camera
+        for (const lineName of Object.keys(lines[currentCamera])) {
+            const lineBox = document.getElementById(`${lineName}-box`);
+            if (lineBox) {
+                // If a box exists for a defined line, show it
+                lineBox.classList.remove('hidden');
             }
         }
     }
 }
+
+/*function updateLineCounts() {
+    fetch(`/get_line_counts?camera_id=${currentCamera}`)
+        .then(response => response.json())
+        .then(data => {
+            const cameraLines = data.line_counts?.[currentCamera] || {};
+            for (const [lineName, countData] of Object.entries(cameraLines)) {
+                const inElement = document.getElementById(`${lineName}_in`);
+                const outElement = document.getElementById(`${lineName}_out`);
+
+                if (inElement) inElement.textContent = countData.in_count;
+                if (outElement) outElement.textContent = countData.out_count;
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching line counts:', error);
+        });
+}*/
+
+function updateLineCounts() {
+    console.log('🔄 Fetching line counts for camera:', currentCamera);
+    
+    fetch(`/get_line_counts?camera_id=${currentCamera}`)
+        .then(response => {
+            console.log('📡 Line counts API response status:', response.status);
+            return response.json();
+        })
+        .then(data => {
+            console.log('📊 Raw line counts data:', data);
+            
+            // ✅ FIXED: Access line_counts directly from response
+            const cameraLines = data.line_counts?.[currentCamera] || {};
+            console.log('🎯 Camera lines for', currentCamera, ':', cameraLines);
+            
+            let updatedCount = 0;
+            for (const [lineName, countData] of Object.entries(cameraLines)) {
+                console.log(`📋 Processing ${lineName}:`, countData);
+                
+                const inElement = document.getElementById(`${lineName}_in`);
+                const outElement = document.getElementById(`${lineName}_out`);
+
+                if (inElement) {
+                    const oldValue = inElement.textContent;
+                    inElement.textContent = countData.in_count;
+                    console.log(`✅ Updated ${lineName}_in: ${oldValue} → ${countData.in_count}`);
+                    updatedCount++;
+                } else {
+                    console.error(`❌ Element ${lineName}_in not found in DOM`);
+                }
+                
+                if (outElement) {
+                    const oldValue = outElement.textContent;
+                    outElement.textContent = countData.out_count;
+                    console.log(`✅ Updated ${lineName}_out: ${oldValue} → ${countData.out_count}`);
+                    updatedCount++;
+                } else {
+                    console.error(`❌ Element ${lineName}_out not found in DOM`);
+                }
+            }
+            
+            console.log(`📋 Total line count elements updated: ${updatedCount}`);
+        })
+        .catch(error => {
+            console.error('❌ Error fetching line counts:', error);
+        });
+}
+
 
 // Update history table
 function updateHistory() {
@@ -261,6 +402,8 @@ function initZoneButtons() {
                 selectedZone = null;
                 zoneButtons.forEach(btn => btn.classList.remove('active'));
             } else {
+                selectedLine = null;
+                document.querySelectorAll('.line-buttons button').forEach(btn => btn.classList.remove('active'));
                 // Select new zone
                 selectedZone = button.getAttribute('data-zone');
                 zoneButtons.forEach(btn => btn.classList.remove('active'));
@@ -342,7 +485,9 @@ function handleMouseLeave() {
 }
 
 function handleSnapshotMouseDown(e) {
-    if (!selectedZone) return;
+    if (!selectedZone && !selectedLine) return;
+
+    console.log('Selected line:', selectedLine);
     
     isDrawing = true;
     const rect = snapshotOverlay.getBoundingClientRect();
@@ -353,51 +498,96 @@ function handleSnapshotMouseDown(e) {
 }
 
 function handleSnapshotMouseMove(e) {
-    if (!isDrawing || !selectedZone) return;
-    
+    if (!isDrawing || (!selectedZone && !selectedLine)) return;
+
     const rect = snapshotOverlay.getBoundingClientRect();
     const currentPoint = [
         e.clientX - rect.left,
         e.clientY - rect.top
     ];
-    
-    // Redraw all zones
-    drawAllZones(snapshotCtx, snapshotOverlay.width, snapshotOverlay.height);
+
+    // Clear and redraw all zones and lines
     snapshotCtx.clearRect(0, 0, snapshotOverlay.width, snapshotOverlay.height);
-    
-    // Draw current selection
-    const width = currentPoint[0] - startPoint[0];
-    const height = currentPoint[1] - startPoint[1];
-    
-    snapshotCtx.fillStyle = zoneColors[selectedZone] || 'rgba(128, 128, 128, 0.3)';
-    snapshotCtx.fillRect(startPoint[0], startPoint[1], width, height);
-    
-    snapshotCtx.strokeStyle = 'red';
-    snapshotCtx.lineWidth = 2;
-    snapshotCtx.strokeRect(startPoint[0], startPoint[1], width, height);
+    drawAllZones(snapshotCtx, snapshotOverlay.width, snapshotOverlay.height);
+
+    if (selectedZone) {
+        const width = currentPoint[0] - startPoint[0];
+        const height = currentPoint[1] - startPoint[1];
+
+        snapshotCtx.fillStyle = zoneColors[selectedZone] || 'rgba(128, 128, 128, 0.3)';
+        snapshotCtx.fillRect(startPoint[0], startPoint[1], width, height);
+        snapshotCtx.strokeStyle = 'red';
+        snapshotCtx.strokeRect(startPoint[0], startPoint[1], width, height);
+    }
+
+    if (selectedLine) {
+        console.log('Drawing line:', selectedLine);
+        snapshotCtx.strokeStyle = 'blue';
+        snapshotCtx.lineWidth = 2;
+        snapshotCtx.beginPath();
+        snapshotCtx.moveTo(startPoint[0], startPoint[1]);
+        snapshotCtx.lineTo(currentPoint[0], currentPoint[1]);
+        snapshotCtx.stroke();
+    }
 }
 
 function handleSnapshotMouseUp(e) {
-    if (!isDrawing || !selectedZone) return;
-    
+    if (!isDrawing || (!selectedZone && !selectedLine)) return;
+
     const rect = snapshotOverlay.getBoundingClientRect();
-    const endPoint = [
-        e.clientX - rect.left,
-        e.clientY - rect.top
-    ];
+    const endPoint = [e.clientX - rect.left, e.clientY - rect.top];
+
+    //const imageElement = document.getElementById('snapshot-image');
+
+    const scaleX = ORIGINAL_VIDEO_WIDTH / snapshotOverlay.width;
+    const scaleY = ORIGINAL_VIDEO_HEIGHT / snapshotOverlay.height;
+
     
-    saveZoneFromSnapshot(startPoint, endPoint);
+
+
+    if (selectedZone) {
+
+        const scaleX = ORIGINAL_VIDEO_WIDTH / snapshotOverlay.width;  // Same as lines
+        const scaleY = ORIGINAL_VIDEO_HEIGHT / snapshotOverlay.height; // Same as lines
+
+        const topLeft = [Math.min(startPoint[0], endPoint[0]) * scaleX, Math.min(startPoint[1], endPoint[1]) * scaleY];
+        const bottomRight = [Math.max(startPoint[0], endPoint[0]) * scaleX, Math.max(startPoint[1], endPoint[1]) * scaleY];
+        socket.emit('set_zone', {
+            camera_id: currentCamera,
+            zone: selectedZone,
+            top_left: topLeft.map(Math.round),
+            bottom_right: bottomRight.map(Math.round)
+        });
+        showToast(`Zone ${selectedZone} set successfully`);
+
+        selectedZone = null;
+        document.querySelectorAll('.zone-buttons button').forEach(btn => btn.classList.remove('active'));
+    } 
+    
+    else if (selectedLine) {
+        const start = [startPoint[0] * scaleX, startPoint[1] * scaleY];
+        const end = [endPoint[0] * scaleX, endPoint[1] * scaleY];
+        socket.emit('set_line', {
+            camera_id: currentCamera,
+            line: selectedLine,
+            start: start.map(Math.round),
+            end: end.map(Math.round)
+        });
+        showToast(`Line ${selectedLine} set successfully`);
+
+        selectedLine = null;
+        document.querySelectorAll('.line-buttons button').forEach(btn => btn.classList.remove('active'));
+    }
+
+
     isDrawing = false;
-    
-    
-    // Reset zone selection
     selectedZone = null;
-    document.querySelectorAll('.zone-buttons button').forEach(btn => btn.classList.remove('active'));
-    
-    drawAllZones(snapshotctx, snapshotOverlay.width, snapshotOverlay.height);
-
-
+    selectedLine = null;
+    document.querySelectorAll('.zone-buttons button, .line-buttons button').forEach(btn => btn.classList.remove('active'));
+    drawAllZones(snapshotCtx, snapshotOverlay.width, snapshotOverlay.height);
 }
+
+
 
 function saveZone(start, end) {
     if (!selectedZone || !currentCamera) return;
@@ -478,6 +668,13 @@ function initSnapshot() {
                 const url = URL.createObjectURL(blob);
                 snapshotImage.src = url;
                 snapshotModal.classList.remove('hidden');
+                snapshotImage.onload = function() {
+                    setTimeout(() => {
+                        setupSnapshotCanvas();
+                        drawAllZones(snapshotCtx, snapshotOverlay.width, snapshotOverlay.height);
+                        loadLines();
+                    }, 100);
+                };
             })
             .catch(error => {
                 console.error('Error taking snapshot:', error);
@@ -488,8 +685,44 @@ function initSnapshot() {
     closeSnapshot.addEventListener('click', () => {
         snapshotModal.classList.add('hidden');
         URL.revokeObjectURL(snapshotImage.src);
+        selectedZone = null;
+        selectedLine = null;
+        document.querySelectorAll('.zone-buttons button, .line-buttons button').forEach(btn => btn.classList.remove('active')); 
     });
 }
+
+function initLineButtons() {
+    const lineButtons = document.querySelectorAll('.line-buttons button');
+    lineButtons.forEach(button => {
+        button.addEventListener('click', () => {
+            if (selectedLine === button.getAttribute('data-line')) {
+                selectedLine = null;
+                button.classList.remove('active');
+            } else {
+                selectedZone = null;
+                document.querySelectorAll('.zone-buttons button').forEach(btn => btn.classList.remove('active'));
+                selectedLine = button.getAttribute('data-line');
+                console.log('Selected line:', selectedLine);
+                document.querySelectorAll('.line-buttons button').forEach(btn => btn.classList.remove('active'));
+                button.classList.add('active');
+            }
+        });
+    });
+}
+
+function loadLines() {
+    fetch(`/api/camera/${currentCamera}/lines`)
+        .then(response => response.json())
+        .then(data => {
+            lines[currentCamera] = data.lines;
+            drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+        })
+        .catch(error => {
+            console.error('Error loading lines:', error);
+        });
+}
+
+
 
 // Reset zone counts
 function initResetButtons() {
@@ -697,7 +930,6 @@ socket.on('connect', () => {
 socket.on('update_counts', (data) => {
     zones = data.data;
     currentCamera = data.active_camera;
-    updateZoneBoxes();
     updateHistory();
 });
 
@@ -720,7 +952,7 @@ socket.on('camera_changed', (data) => {
     videoFeed.src = `/video_feed?camera_id=${currentCamera}`;
     
     // Update active button
-    const buttons = document.querySelectorAll('#camera-selector button');
+    const buttons = document.querySelectorAll('#camera-buttons button');
     buttons.forEach(button => {
         button.classList.remove('active');
         if (button.getAttribute('data-camera') === currentCamera) {
@@ -732,8 +964,30 @@ socket.on('camera_changed', (data) => {
     drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
 });
 
+socket.on('line_updated', (data) => {
+    lines = data.lines;
+    drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+});
+
+socket.on('line_counts_updated', (data) => {
+    
+    const cameraLines = data.line_counts || {};
+
+    //const cameraLines = data.line_counts?.[data.camera_id] || {};
+    for (const [lineName, countData] of Object.entries(cameraLines)) {
+        const inElement = document.getElementById(`${lineName}_in`);
+        const outElement = document.getElementById(`${lineName}_out`);
+
+        if (inElement) inElement.textContent = countData.in_count;
+        if (outElement) outElement.textContent = countData.out_count;
+    }
+
+
+});
+
+
 socket.on('error', (data) => {
-    showToast(data.message);
+    showToast(data.message || 'Unknown error occurred');
 });
 
 function initializeSources() {
@@ -802,17 +1056,50 @@ function initializeSources() {
     });
 }
 
+function debugLineCountElements() {
+    const lineElements = ['line1_in', 'line1_out', 'line2_in', 'line2_out', 'line3_in', 'line3_out'];
+    
+    lineElements.forEach(id => {
+        const element = document.getElementById(id);
+        if (element) {
+            console.log(`✅ Element ${id} EXISTS, current value: "${element.textContent}"`);
+        } else {
+            console.error(`❌ Element ${id} MISSING from DOM`);
+        }
+    });
+}
+
+debugLineCountElements();
+
+
 // Initialize application
-document.addEventListener('DOMContentLoaded', () => {
+function initializeApp() {
     loadCameras();
     loadZones();
+    loadLines();
     initZoneButtons();
+    initLineButtons();
     initDrawing();
     initSnapshot();
     initResetButtons();
     initFilters();
     initializeSources();
-    
     setupCanvas();
     drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
-});
+
+    setTimeout(() => {
+        console.log('🔄 Running startup debug...');
+        debugLineCountElements();
+        updateLineCounts();
+    }, 2000);
+
+    /*setInterval(() => {
+        if (currentCamera) {
+            updateLineCounts();
+        }
+    }, 5000);*/ // Update line counts every 5 seconds
+}
+
+
+
+document.addEventListener('DOMContentLoaded', initializeApp);

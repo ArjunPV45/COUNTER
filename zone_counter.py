@@ -8,6 +8,7 @@ Enhanced Multi-Camera Zone Visitor Counter
 
 import json
 import datetime
+import numpy as np
 from typing import Dict, Set, List, Tuple, Any, Optional
 from hailo_apps_infra.hailo_rpi_common import app_callback_class
 from config import HISTORY_FILE, DEFAULT_ZONE_CONFIG
@@ -39,6 +40,8 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
             self._init_camera(camera_id)
         
         self.active_camera = list(self.data.keys())[0] if self.data else "camera1"
+        self.lines = {}  # {camera_id: {line_name: line_data}}
+        self.line_cross_tracker = {}  # {camera_id: {line_name: set(person_ids)}}
 
     def _init_camera(self, camera_id: str) -> None:
         """Initialize all tracking structures for a camera."""
@@ -57,15 +60,20 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
         """Load zone configurations from file or initialize defaults."""
         try:
             with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
+                raw_data = json.load(f)
+                self.lines = raw_data.get("_lines", {})
+                return {k: v for k, v in raw_data.items() if not k.startswith("_")}
         except (FileNotFoundError, json.JSONDecodeError):
+            self.lines = {}
             return {"camera1": {"zones": DEFAULT_ZONE_CONFIG.copy()}}
 
     def save_data(self) -> None:
         """Persist zone configurations and counts."""
         try:
+            data_to_save = self.data.copy()
+            data_to_save["_lines"] = self.lines
             with open(HISTORY_FILE, "w") as f:
-                json.dump(self.data, f, indent=4)
+                json.dump(data_to_save, f, indent=4)
         except Exception as e:
             print(f"[ERROR] Failed to save data: {e}")
 
@@ -174,6 +182,8 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
                 self.inside_zones[camera_id][zone] = current_inside
                 zone_data["inside_ids"] = list(current_inside)
             
+            self.update_line_counts(camera_id, detected_people)
+
             self.save_data()
             
         except Exception as e:
@@ -359,6 +369,20 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
             print(f"[ERROR] Failed to delete zone {zone}: {e}")
             return False
 
+    def reset_line_counts(self, camera_id: str, line_name: str) -> bool:
+        try:
+            if camera_id not in self.lines or line_name not in self.lines[camera_id]:
+                return False
+            self.lines[camera_id][line_name]["in_count"] = 0
+            self.lines[camera_id][line_name]["out_count"] = 0
+            self.lines[camera_id][line_name]["history"] = []
+            self.line_cross_tracker[camera_id][line_name] = {}
+            self.save_data()
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to reset line {line_name}: {e}")
+            return False
+
     def set_active_camera(self, camera_id: str) -> bool:
         """Set the active camera for UI display."""
         if camera_id in self.data:
@@ -367,6 +391,94 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
             return True
         print(f"[WARNING] Camera {camera_id} not found in data")
         return False
+
+    def create_or_update_line(self, camera_id: str, line_name: str, start: List[int], end: List[int]) -> bool:
+        """Create or update a directional line for crossing detection."""
+        try:
+            if camera_id not in self.lines:
+                self.lines[camera_id] = {}
+            if camera_id not in self.line_cross_tracker:
+                self.line_cross_tracker[camera_id] = {}
+
+            self.lines[camera_id][line_name] = {
+                "start": start,
+                "end": end,
+                "in_count": 0,
+                "out_count": 0,
+                "history": []
+            }
+            self.line_cross_tracker[camera_id][line_name] = {}
+            self.save_data()
+            print(f"[INFO] Created/updated line '{line_name}' for camera '{camera_id}'")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to create/update line {line_name}: {e}")
+            return False
+
+    def delete_line(self, camera_id: str, line_name: str) -> bool:
+        try:
+            if camera_id in self.lines and line_name in self.lines[camera_id]:
+                del self.lines[camera_id][line_name]
+            if camera_id in self.line_cross_tracker and line_name in self.line_cross_tracker[camera_id]:
+                del self.line_cross_tracker[camera_id][line_name]
+            self.save_data()
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to delete line {line_name}: {e}")
+            return False
+
+    def get_line_stats(self, camera_id: str, line_name: str) -> Optional[Dict[str, Any]]:
+        if camera_id in self.lines and line_name in self.lines[camera_id]:
+            return self.lines[camera_id][line_name]
+        return None
+    
+    def update_line_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
+        """Update line crossing counts based on movement direction."""
+        try:
+            if camera_id not in self.lines:
+                return
+
+            for line_name, line_data in self.lines[camera_id].items():
+                if line_name not in self.line_cross_tracker[camera_id]:
+                    self.line_cross_tracker[camera_id][line_name] = {}
+
+                tracker = self.line_cross_tracker[camera_id][line_name]
+                p1 = np.array(line_data["start"])
+                p2 = np.array(line_data["end"])
+                line_vec = p2 - p1
+                line_norm = np.array([-line_vec[1], line_vec[0]])  # perpendicular for side checking
+
+                for person in detected_people:
+                    person_id, x, y = person
+                    current = np.array([x, y])
+                    prev = tracker.get(person_id)
+
+                    if prev is not None:
+                        # Determine which side of line each point is on
+                        side_prev = np.dot(prev - p1, line_norm)
+                        side_curr = np.dot(current - p1, line_norm)
+
+                        if side_prev * side_curr < 0:  # Crossed the line
+                            direction = "in" if side_curr > 0 else "out"
+                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                            if direction == "in":
+                                self.lines[camera_id][line_name]["in_count"] += 1
+                                self.lines[camera_id][line_name]["history"].append({
+                                    "id": person_id, "action": "In", "time": timestamp
+                                })
+                            else:
+                                self.lines[camera_id][line_name]["out_count"] += 1
+                                self.lines[camera_id][line_name]["history"].append({
+                                    "id": person_id, "action": "Out", "time": timestamp
+                                })
+
+                    tracker[person_id] = current
+
+            self.save_data()
+        except Exception as e:
+            print(f"[ERROR] Line counting failed for {camera_id}: {e}")
+
 
     def create_or_update_zone(self, camera_id: str, zone: str,
                             top_left: List[int], bottom_right: List[int]) -> bool:
@@ -486,6 +598,10 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
                 })
         
         return real_new_entries
+
+    def get_all_lines(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Return all lines for all cameras."""
+        return self.lines
 
     def _process_exits(self, camera_id: str, zone: str, newly_exited: Set[int], 
                       timestamp: datetime.datetime, timestamp_str: str) -> Set[int]:

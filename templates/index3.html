@@ -196,6 +196,21 @@
           min-width: 100px;
         }
 
+        .line-box {
+          background-color: white;
+          border-radius: var(--border-radius);
+          box-shadow: var(--shadow);
+          padding: 1.2rem;
+          transition: transform 0.2s, box-shadow 0.2s;
+          /* mimic .zone-box */
+        }
+
+        .line-box:hover {
+          transform: translateY(-3px);
+          box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+
         /* Zone grid */
         .zone-container {
           display: grid;
@@ -460,6 +475,22 @@
             background-color: rgba(231, 76, 60, 1);
         }
 
+        .line-buttons button {
+            background-color: var(--secondary);
+            color: white;
+            margin: 0 5px;
+            padding: 8px 15px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s, transform 0.1s;
+        }
+
+        .line-buttons button:hover {
+            background-color: #c60058;
+            transform: translateY(-2px);
+        }
+
         #snapshot-image {
             max-width: 100%;
             height: 90vh;
@@ -660,7 +691,10 @@
                 <img id="video-feed" src="{{ url_for('video_feed') }}" alt="Live Video Stream">
                 <canvas id="zone-overlay"></canvas>
         </div>
+
         
+        
+
         <!-- Snapshot Modal -->
         <div id="snapshot-modal" class="snapshot-modal hidden">
             <div class="snapshot-content">
@@ -673,17 +707,82 @@
                     <button data-zone="zone4" style="background-color: #38b000;">Select Zone 4</button>
                     <button data-zone="zone5" style="background-color: #38b000;">Select Zone 5</button>
                 </div>
+                <div class="line-buttons" style="margin-top: 10px; text-align: center;">
+                  <button data-line="line1" style="background-color: #ff006e;">Draw Line 1</button>
+                  <button data-line="line2" style="background-color: #ff006e;">Draw Line 2</button>
+                  <button data-line="line3" style="background-color: #ff006e;">Draw Line 3</button>
+                </div>
                 <div style="position: relative;">
                     <img id="snapshot-image" alt="Snapshot">
                     <canvas id="snapshot-overlay"></canvas>
                 </div>
             </div>
         </div>
-        
+
+
+        <div class="card">
+          <div class="card-header">
+            <h2>Entry Counting</h2>
+          </div>
+          <div class="zone-container" id="line-monitoring-container">
+            <div class ="line-box zone-box hidden" id="line1-box">
+              <div class="zone-title">
+                <i class="fas fa-arrows-alt-h"></i>
+                <h3>Line 1</h3>
+              </div>
+              <div class="zone-stats">
+                <div class="stat-box in">
+                  <div class="stat-value " id="line1_in">0</div>
+                  <div class="stat-label">IN</div>
+                </div>
+                <div class="stat-box out">
+                  <div class="stat-value" id="line1_out">0</div>
+                  <div class="stat-label">OUT</div>
+                </div>
+              </div>
+            </div>
+
+            <div class ="line-box zone-box hidden" id="line2-box">
+              <div class="zone-title">
+                <i class="fas fa-arrows-alt-h"></i>
+                <h3>Line 2</h3>
+              </div>
+              <div class="zone-stats">
+                <div class="stat-box in">
+                  <div class="stat-value" id="line2_in">0</div> 
+                  <div class="stat-label">IN</div>
+                </div>
+                <div class="stat-box out">
+                  <div class="stat-value" id="line2_out">0</div>  
+                  <div class="stat-label">OUT</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="line-box zone-box hidden" id="line3-box">
+              <div class="zone-title">
+                <i class="fas fa-arrows-alt-h"></i>
+                <h3>Line 3</h3>
+              </div>
+              <div class="zone-stats">
+                <div class="stat-box in">
+                  <div class="stat-value" id="line3_in">0</div>
+                  <div class="stat-label">IN</div>
+                </div>
+                <div class="stat-box out">
+                  <div class="stat-value" id="line3_out">0</div>
+                  <div class="stat-label">OUT</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+
         <h2>Zone Monitoring</h2>
-        <div class="zone-container">
+        <div class="zone-container" id="zone-monitoring-container">
           <!-- Zone 1 -->
-          <div class="zone-box" id="zone1-box">
+          <div class="zone-box hidden" id="zone1-box">
             <div class="zone-title">
               <i class="fas fa-map-marker-alt"></i>
               <h3>Zone 1</h3>
@@ -708,7 +807,7 @@
           </div>
 
           <!-- Zone 2 -->
-          <div class="zone-box" id="zone2-box">
+          <div class="zone-box hidden" id="zone2-box">
             <div class="zone-title">
               <i class="fas fa-map-marker-alt"></i>
               <h3>Zone 2</h3>
@@ -733,7 +832,7 @@
           </div>
 
           <!-- Zone 3 -->
-          <div class="zone-box" id="zone3-box">
+          <div class="zone-box hidden" id="zone3-box">
             <div class="zone-title">
               <i class="fas fa-map-marker-alt"></i>
               <h3>Zone 3</h3>
@@ -758,7 +857,7 @@
           </div>
 
           <!-- Zone 4 -->
-          <div class="zone-box" id="zone4-box">
+          <div class="zone-box hidden" id="zone4-box">
             <div class="zone-title">
               <i class="fas fa-map-marker-alt"></i>
               <h3>Zone 4</h3>
@@ -783,7 +882,7 @@
           </div>
 
           <!-- Zone 5 -->
-          <div class="zone-box" id="zone5-box">
+          <div class="zone-box hidden" id="zone5-box">
             <div class="zone-title">
               <i class="fas fa-map-marker-alt"></i>
               <h3>Zone 5</h3>

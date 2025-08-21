@@ -230,6 +230,103 @@ def register_routes(app: Flask, user_data, pipeline_manager, video_stream_manage
             "data": user_data.data
         })
 
+    @app.route("/api/camera/<camera_id>/lines", methods=["POST"])
+    def create_camera_line(camera_id):
+        """Create or update a line for a specific camera."""
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        required_fields = ["line", "start", "end"]
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+
+        line = data["line"]
+        start = data["start"]
+        end = data["end"]
+
+        success = user_data.create_or_update_line(camera_id, line, start, end)
+
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Line '{line}' created/updated for camera {camera_id}",
+                "line_data": user_data.lines[camera_id][line]
+            }), 201
+        else:
+            return jsonify({"error": "Invalid line coordinates"}), 400
+
+    
+    @app.route("/api/camera/<camera_id>/lines", methods=["GET"])
+    def get_camera_lines(camera_id):
+        """Get all lines configured for a specific camera."""
+        if camera_id not in user_data.lines:
+            return jsonify({
+                "camera_id": camera_id,
+                "lines": {}
+            })
+        return jsonify({
+            "camera_id": camera_id,
+            "lines": user_data.lines[camera_id]
+        })
+
+    @app.route("/api/camera/<camera_id>/lines/<line>", methods=["DELETE"])
+    def delete_camera_line(camera_id, line):
+        """Delete a specific line from a camera."""
+        success = user_data.delete_line(camera_id, line)
+
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"Line '{line}' deleted from camera {camera_id}"
+            })
+        else:
+            return jsonify({"error": f"Line {line} not found in camera {camera_id}"}), 404
+
+    @app.route("/get_line_counts", methods=["GET"])
+    def get_line_counts():
+        """
+        Return live in/out counts for each line.
+        Optional query param: ?camera_id=camera1
+        """
+        def extract_line_counts(lines):
+            return {
+                line_name: {
+                    "in_count": line_data.get("in_count", 0),
+                    "out_count": line_data.get("out_count", 0),
+                    "history": line_data.get("history", [])
+                }
+                for line_name, line_data in lines.items()
+            }
+
+        camera_id = request.args.get("camera_id")
+
+        if camera_id:
+            if camera_id not in user_data.lines:
+                return jsonify({
+                    "camera_id": camera_id,
+                    "line_counts": {camera_id: {}}
+                 }) #"error": f"No lines found for camera {camera_id}"}), 404
+
+            return jsonify({
+                "camera_id": camera_id,
+                "line_counts": {camera_id: extract_line_counts(user_data.lines[camera_id])}
+            })
+
+        all_line_counts = {}
+        for cam_id, lines in user_data.lines.items():
+            all_line_counts[cam_id] = extract_line_counts(lines)
+
+            #cam_id: extract_line_counts(lines)
+            #for cam_id, lines in user_data.lines.items()
+        #}
+
+        return jsonify({
+            "line_counts": all_line_counts
+        })
+
+
     @app.route("/health")
     def health_check():
         """Health check endpoint."""

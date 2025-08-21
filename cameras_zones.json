@@ -1,1 +1,6 @@
-
+{
+    "video_sources": [
+        "rtsp://centelon_tvm:Cent%409876@10.71.172.50:554/Streaming/Channels/201",
+        "rtsp://centelon_tvm:Cent%409876@10.71.172.50:554/Streaming/Channels/301"
+    ]
+}

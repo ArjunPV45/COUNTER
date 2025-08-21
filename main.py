@@ -92,7 +92,7 @@ def create_app():
         logging.warning(f"Failed to load config or start pipeline: {e}")
     
     # Register SocketIO handlers
-    register_socketio_handlers(socketio, user_data)
+    register_socketio_handlers(socketio, user_data, pipeline_manager)
     
     # Register web routes
     register_routes(app, user_data, pipeline_manager, video_stream_manager)
@@ -102,6 +102,7 @@ def create_app():
         'frame_buffers': frame_buffers,
         'pipeline_manager': pipeline_manager,
         'video_stream_manager': video_stream_manager
+        
     }
     
     return app, socketio, components
@@ -125,6 +126,12 @@ def main():
         logger.info(f"Application created successfully")
         logger.info(f"Available cameras: {list(components['user_data'].data.keys())}")
         logger.info(f"Active camera: {components['user_data'].active_camera}")
+
+        if components['user_data'].lines:
+            for cam, lines in components['user_data'].lines.items():
+                logger.info(f"Camera {cam} has {len(lines)} lines: {list(lines.keys())}")
+        else:
+            logger.info("No lines configured for any camera")
         
         # Start the server
         logger.info(f"Starting server on {SERVER_HOST}:{SERVER_PORT}")

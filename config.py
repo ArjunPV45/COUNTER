@@ -8,6 +8,7 @@ import os
 
 CONFIG_FILE = "cameras_zones.json"
 
+LINE_HISTORY_FILE = "line_data.json"
 
 def load_config(filename=CONFIG_FILE):
     if os.path.exists(filename):

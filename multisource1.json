@@ -1,1 +1,86 @@
-
+{
+    "camera1": {
+        "zones": {
+            "zone1": {
+                "top_left": [
+                    600,
+                    81
+                ],
+                "bottom_right": [
+                    1112,
+                    525
+                ],
+                "in_count": 3,
+                "out_count": 3,
+                "inside_ids": [],
+                "history": [
+                    {
+                        "id": 5,
+                        "action": "Entered",
+                        "time": "2025-08-21 22:58:34"
+                    },
+                    {
+                        "id": 5,
+                        "action": "Exited",
+                        "time": "2025-08-21 22:58:35"
+                    },
+                    {
+                        "id": 5,
+                        "action": "Entered",
+                        "time": "2025-08-21 22:58:37"
+                    },
+                    {
+                        "id": 5,
+                        "action": "Exited",
+                        "time": "2025-08-21 22:58:42"
+                    },
+                    {
+                        "id": 7,
+                        "action": "Entered",
+                        "time": "2025-08-21 22:58:50"
+                    },
+                    {
+                        "id": 7,
+                        "action": "Exited",
+                        "time": "2025-08-21 22:58:55"
+                    }
+                ]
+            }
+        }
+    },
+    "camera2": {
+        "zones": {}
+    },
+    "_lines": {
+        "camera1": {
+            "line1": {
+                "start": [
+                    654,
+                    26
+                ],
+                "end": [
+                    626,
+                    896
+                ],
+                "in_count": 0,
+                "out_count": 0,
+                "history": []
+            }
+        },
+        "camera2": {
+            "line1": {
+                "start": [
+                    1003,
+                    87
+                ],
+                "end": [
+                    999,
+                    826
+                ],
+                "in_count": 0,
+                "out_count": 0,
+                "history": []
+            }
+        }
+    }
+}
