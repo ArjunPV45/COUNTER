@@ -180,6 +180,8 @@ function switchCamera(cameraId) {
     updateZoneBoxes();
     updateLineCounts();
 
+    loadLineHistory(cameraId);
+
     setTimeout(() => {
         drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
     
@@ -753,6 +755,40 @@ function initResetButtons() {
     });
 }
 
+// Load line history for the active camera
+async function loadLineHistory(cameraId) {
+  try {
+    const res = await fetch(`/get_line_history/${cameraId}`);
+    const data = await res.json();
+
+    const tbody = document.querySelector("#line_history_table tbody");
+    tbody.innerHTML = ""; // clear old rows
+
+    if (!data.line_history || Object.keys(data.line_history).length === 0) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td colspan="4" style="text-align:center; color:gray;">No line history available</td>`;
+      tbody.appendChild(tr);
+      return;
+    }
+
+    for (const [lineName, history] of Object.entries(data.line_history)) {
+      history.forEach(entry => {
+        const tr = document.createElement("tr");
+        tr.className = entry.action.toLowerCase(); // "in" or "out" class
+        tr.innerHTML = `
+          <td>${lineName}</td>
+          <td>${entry.id}</td>
+          <td>${entry.action}</td>
+          <td>${entry.time}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+  } catch (err) {
+    console.error("❌ Error fetching line history:", err);
+  }
+}
+
 // History filtering
 function initFilters() {
     const applyFiltersBtn = document.getElementById('apply-filters');
@@ -1101,6 +1137,12 @@ function debugLineCountElements() {
 }
 
 debugLineCountElements();
+
+setInterval(() => {
+  if (currentCamera) {
+    loadLineHistory(currentCamera);
+  }
+}, 5000);
 
 
 // Initialize application
