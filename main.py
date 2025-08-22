@@ -24,6 +24,7 @@ from video_stream import VideoStreamManager
 from socketio_handlers import register_socketio_handlers
 from web_routes import register_routes
 
+logging.disable(logging.CRITICAL)  # Disable verbose logging from libraries
 
 # Global components for cleanup
 components = None
@@ -49,7 +50,6 @@ def setup_logging():
         level=logging.INFO if not DEBUG_MODE else logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('visitor_counter.log'),
             logging.StreamHandler(sys.stdout)
         ]
     )

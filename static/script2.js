@@ -30,8 +30,8 @@ const ctx = canvasOverlay.getContext("2d");
 const snapshotCtx = snapshotOverlay.getContext("2d");
 
 // Fixed original video dimensions
-const ORIGINAL_VIDEO_WIDTH = 1920;
-const ORIGINAL_VIDEO_HEIGHT = 1080;
+const ORIGINAL_VIDEO_WIDTH = 1300;
+const ORIGINAL_VIDEO_HEIGHT = 720;
 
 function drawAllLines(context, width, height) {
     if (!lines[currentCamera]) return;
@@ -178,8 +178,12 @@ function switchCamera(cameraId) {
     loadZones();
     loadLines();
     updateZoneBoxes();
-    updateLineBoxesVisibility();
     updateLineCounts();
+
+    setTimeout(() => {
+        drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+    
+    }, 500);
 }
 
 // Load zones from server
@@ -262,8 +266,11 @@ function updateZoneBoxes() {
             insideList.appendChild(li);
         }
     }
+    updateLineBoxesVisibility();
     updateLineCounts();
 }
+
+
 
 
 // Add this new function
@@ -447,8 +454,9 @@ function handleMouseMove(e) {
     ];
     
     // Redraw all zones
-    //drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+    
     ctx.clearRect(0, 0, canvasOverlay.width, canvasOverlay.height);
+    drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
     
     // Draw current selection
     const width = currentPoint[0] - startPoint[0];
@@ -607,6 +615,8 @@ function saveZone(start, end) {
         Math.max(start[1], end[1]) * scaleY
     ];
     
+    const z = selectedZone;
+
     // Send to server
     socket.emit('set_zone', {
         camera_id: currentCamera,
@@ -616,10 +626,12 @@ function saveZone(start, end) {
     });
     
     // Reset selection
-    selectedZone = null;
+    //selectedZone = null;
     document.querySelectorAll('.zone-buttons button').forEach(btn => btn.classList.remove('active'));
     
+
     showToast(`Zone ${selectedZone} set successfully`);
+    selectedZone = null;
 }
 
 function saveZoneFromSnapshot(start, end) {
@@ -714,8 +726,9 @@ function loadLines() {
     fetch(`/api/camera/${currentCamera}/lines`)
         .then(response => response.json())
         .then(data => {
-            lines[currentCamera] = data.lines;
+            lines[currentCamera] = data.lines || {};
             drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+            updateLineBoxesVisibility();
         })
         .catch(error => {
             console.error('Error loading lines:', error);
@@ -925,11 +938,14 @@ socket.on('connect', () => {
     console.log('Connected to server');
     loadCameras();
     loadZones();
+    loadLines();
 });
 
 socket.on('update_counts', (data) => {
     zones = data.data;
     currentCamera = data.active_camera;
+    updateZoneBoxes();
+    drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
     updateHistory();
 });
 
@@ -941,7 +957,9 @@ socket.on('count_reset', (data) => {
 
 socket.on('zone_updated', (data) => {
     zones = data.data;
+    updateZoneBoxes();
     drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+    updateHistory();
 });
 
 socket.on('camera_changed', (data) => {
@@ -961,17 +979,28 @@ socket.on('camera_changed', (data) => {
     });
     
     updateZoneBoxes();
+    loadLines();
     drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
 });
 
 socket.on('line_updated', (data) => {
     lines = data.lines;
     drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+    updateHistory();
 });
 
 socket.on('line_counts_updated', (data) => {
     
-    const cameraLines = data.line_counts || {};
+    //const cameraLines = data.line_counts || {};
+
+    let cameraLines = {};
+    if (data.line_counts) {
+        // If data has nested structure: {line_counts: {camera1: {...}}}
+        cameraLines = data.line_counts[currentCamera] || data.line_counts || {};
+    } else {
+        // If data is flat: {line1: {...}, line2: {...}}
+        cameraLines = data;
+    }
 
     //const cameraLines = data.line_counts?.[data.camera_id] || {};
     for (const [lineName, countData] of Object.entries(cameraLines)) {
@@ -981,6 +1010,8 @@ socket.on('line_counts_updated', (data) => {
         if (inElement) inElement.textContent = countData.in_count;
         if (outElement) outElement.textContent = countData.out_count;
     }
+
+    updateHistory();
 
 
 });
@@ -1085,19 +1116,22 @@ function initializeApp() {
     initFilters();
     initializeSources();
     setupCanvas();
-    drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+    //drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
 
     setTimeout(() => {
         console.log('🔄 Running startup debug...');
         debugLineCountElements();
         updateLineCounts();
+        updateLineBoxesVisibility();
+        drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
+
     }, 2000);
 
-    /*setInterval(() => {
+    setInterval(() => {
         if (currentCamera) {
             updateLineCounts();
         }
-    }, 5000);*/ // Update line counts every 5 seconds
+    }, 5000); // Update line counts every 5 seconds
 }
 
 
