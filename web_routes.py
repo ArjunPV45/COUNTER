@@ -337,6 +337,30 @@ def register_routes(app: Flask, user_data, pipeline_manager, video_stream_manage
             "active_camera": user_data.active_camera
         })
 
+    @app.route("/get_line_history/<camera_id>", methods=["GET"])
+    def get_line_history(camera_id):
+        """
+        Return historical in/out events for each line of a given camera.
+        """
+        if camera_id not in user_data.lines:
+            return jsonify({
+                "camera_id": camera_id,
+                "line_history": {}
+            })
+
+        def extract_line_history(lines):
+            return {
+                line_name: line_data.get("history", [])
+                for line_name, line_data in lines.items()
+            }
+
+        return jsonify({
+            "camera_id": camera_id,
+            "line_history": extract_line_history(user_data.lines[camera_id])
+        })
+
+
+
     @app.errorhandler(404)
     def not_found(error):
         """Handle 404 errors."""

@@ -34,7 +34,8 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
         self.bbox_overlap_threshold = 0.3
         self.min_dwell_time = 1.0      # seconds required in zone before counting
         self.exit_grace_time = 1.0     # seconds to wait before confirming exit
-        
+        self.line_gate_width = 150
+
         # Initialize structures for existing cameras
         for camera_id in self.data:
             self._init_camera(camera_id)
@@ -42,6 +43,10 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
         self.active_camera = list(self.data.keys())[0] if self.data else "camera1"
         self.lines = {}  # {camera_id: {line_name: line_data}}
         self.line_cross_tracker = {}  # {camera_id: {line_name: set(person_ids)}}
+        self.line_cooldown_tracker = {}
+        self.crossing_cooldown_seconds = 2.0
+        self.min_movement_threshold = 5.0  # pixels
+        self.state_confirmation_frames = 3
 
     def _init_camera(self, camera_id: str) -> None:
         """Initialize all tracking structures for a camera."""
@@ -400,6 +405,9 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
             if camera_id not in self.line_cross_tracker:
                 self.line_cross_tracker[camera_id] = {}
 
+            if camera_id not in self.line_cooldown_tracker:
+                self.line_cooldown_tracker[camera_id] = {}
+
             self.lines[camera_id][line_name] = {
                 "start": start,
                 "end": end,
@@ -408,6 +416,7 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
                 "history": []
             }
             self.line_cross_tracker[camera_id][line_name] = {}
+            self.line_cooldown_tracker[camera_id][line_name] = {}
             self.save_data()
             print(f"[INFO] Created/updated line '{line_name}' for camera '{camera_id}'")
             return True
@@ -431,9 +440,37 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
         if camera_id in self.lines and line_name in self.lines[camera_id]:
             return self.lines[camera_id][line_name]
         return None
+
     
-    def update_line_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
-        """Update line crossing counts based on movement direction."""
+
+    '''def _check_intersection(self, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> Tuple[bool, int]:
+        
+        v1 = p2 - p1  # Movement vector of the person
+        v2 = p4 - p3  # The defined counting line vector
+
+        # Cross product to determine direction
+        # We only need the Z-component of the 2D cross product
+        cross_product_z = v1[0] * v2[1] - v1[1] * v2[0]
+
+        # Check for intersection using a standard line-segment intersection formula
+        t_num = np.cross(p3 - p1, v2)
+        u_num = np.cross(p3 - p1, v1)
+        denom = np.cross(v1, v2)
+
+        if denom == 0:  # Lines are parallel or collinear
+            return False, 0
+        
+        t = t_num / denom
+        u = u_num / denom
+
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            # Intersection occurs, return direction based on the sign of the denominator
+            # This gives a consistent "in" vs "out" regardless of line angle
+            return True, np.sign(denom)
+        
+        return False, 0'''
+    
+    """def update_line_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
         try:
             if camera_id not in self.lines:
                 return
@@ -477,8 +514,139 @@ class MultiSourceZoneVisitorCounter(app_callback_class):
 
             self.save_data()
         except Exception as e:
-            print(f"[ERROR] Line counting failed for {camera_id}: {e}")
+            print(f"[ERROR] Line counting failed for {camera_id}: {e}")"""
 
+    
+    # --- DELETE the entire _check_intersection function ---
+# def _check_intersection(self, ...):
+#     ...
+
+# --- ADD THIS NEW HELPER FUNCTION in its place ---
+    def _get_side_of_line(self, point: np.ndarray, line_start: np.ndarray, line_end: np.ndarray) -> int:
+        """
+        Determines which side of an infinitely long line a point is on.
+        
+        Returns:
+            -  1: If on one side (e.g., "right" or "IN" depending on line direction)
+            - -1: If on the other side (e.g., "left" or "OUT")
+            -  0: If the point is exactly on the line
+        """
+        line_vec = line_end - line_start
+        point_vec = point - line_start
+        # The Z-component of the 2D cross product gives the side
+        cross_product_z = line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0]
+        return np.sign(cross_product_z)
+
+    # --- REPLACE your entire old update_line_counts function with this new one ---
+
+    # --- REPLACE your entire old update_line_counts function with this new one ---
+
+    def update_line_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
+        """
+        Update line crossing counts using a stateful, jitter-resistant method
+        that RESPECTS THE FINITE LINE SEGMENT.
+        """
+        try:
+            if camera_id not in self.lines:
+                return
+
+            current_time = datetime.datetime.now()
+            active_ids = {p[0] for p in detected_people}
+
+            for line_name, line_data in self.lines[camera_id].items():
+                # Ensure trackers exist
+                if line_name not in self.line_cross_tracker.get(camera_id, {}):
+                    self.line_cross_tracker[camera_id][line_name] = {}
+                if line_name not in self.line_cooldown_tracker.get(camera_id, {}):
+                    self.line_cooldown_tracker[camera_id][line_name] = {}
+
+                tracker = self.line_cross_tracker[camera_id][line_name]
+                cooldown_tracker = self.line_cooldown_tracker[camera_id][line_name]
+                
+                p_line_start = np.array(line_data["start"])
+                p_line_end = np.array(line_data["end"])
+
+                # 1. Cleanup stale trackers and expired cooldowns
+                for person_id in list(tracker.keys()):
+                    if person_id not in active_ids:
+                        del tracker[person_id]
+                stale_cooldowns = [pid for pid, end_time in cooldown_tracker.items() if current_time > end_time]
+                for pid in stale_cooldowns:
+                    del cooldown_tracker[pid]
+
+                # 2. Process each detected person
+                for person_data in detected_people:
+                    person_id = person_data[0]
+                    p_current = np.array(self._get_person_position(person_data, method="center"))
+
+                    if person_id in cooldown_tracker:
+                        continue 
+
+                    # --- START OF THE CRITICAL FIX ---
+                    # 2A. Bounding Box Check: Is the person even near the line segment?
+                    # Create a bounding box around the line segment with a little padding.
+                    line_x_coords = [p_line_start[0], p_line_end[0]]
+                    line_y_coords = [p_line_start[1], p_line_end[1]]
+                    padding = 50 # pixels of padding around the line
+
+                    is_near_line = (min(line_x_coords) - padding <= p_current[0] <= max(line_x_coords) + padding) and \
+                                (min(line_y_coords) - padding <= p_current[1] <= max(line_y_coords) + padding)
+
+                    # If the person is not near the line, we don't need to process them further.
+                    # If they were previously being tracked, we clear their state.
+                    if not is_near_line:
+                        if person_id in tracker:
+                            del tracker[person_id] 
+                        continue
+                    # --- END OF THE CRITICAL FIX ---
+                    
+                    current_side = self._get_side_of_line(p_current, p_line_start, p_line_end)
+                    if current_side == 0:
+                        continue
+                    
+                    # Initialize tracking for a new person who IS near the line
+                    if person_id not in tracker:
+                        tracker[person_id] = {
+                            'position': p_current, 'side': current_side,
+                            'frames_on_side': 1, 'stable': False
+                        }
+                        continue
+                    
+                    person_track = tracker[person_id]
+                    
+                    displacement = np.linalg.norm(p_current - person_track['position'])
+                    if displacement < self.min_movement_threshold and person_track['stable']:
+                        continue
+
+                    # If person has switched sides (and we know they are near the line)
+                    if current_side != person_track['side']:
+                        if person_track['stable']:
+                            timestamp_dt = datetime.datetime.now()
+                            timestamp_str = timestamp_dt.strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            action = "in" if current_side > 0 else "out"
+                            
+                            if action == "in": line_data["in_count"] += 1
+                            else: line_data["out_count"] += 1
+                            
+                            line_data["history"].append({"id": person_id, "action": action.capitalize(), "time": timestamp_str})
+                            
+                            cooldown_end_time = timestamp_dt + datetime.timedelta(seconds=self.crossing_cooldown_seconds)
+                            cooldown_tracker[person_id] = cooldown_end_time
+                            del tracker[person_id]
+                            continue
+                        else:
+                            person_track.update({'side': current_side, 'frames_on_side': 1, 'stable': False})
+                    else:
+                        person_track['frames_on_side'] += 1
+                        if not person_track['stable'] and person_track['frames_on_side'] >= self.state_confirmation_frames:
+                            person_track['stable'] = True
+
+                    person_track['position'] = p_current
+
+            self.save_data()
+        except Exception as e:
+            print(f"[ERROR] Line counting failed for {camera_id}: {e}")
 
     def create_or_update_zone(self, camera_id: str, zone: str,
                             top_left: List[int], bottom_right: List[int]) -> bool:

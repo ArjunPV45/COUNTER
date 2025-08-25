@@ -8,6 +8,7 @@ let isDrawing = false;
 let startPoint = null;
 let zones = {};
 let lines = {};
+let lineHistory = {};
 let currentCamera = "camera1"; // Default active camera
 
 // Zone colors with transparency
@@ -269,7 +270,7 @@ function updateZoneBoxes() {
         }
     }
     updateLineBoxesVisibility();
-    updateLineCounts();
+    //updateLineCounts();
 }
 
 
@@ -312,23 +313,23 @@ function updateLineBoxesVisibility() {
 }*/
 
 function updateLineCounts() {
-    console.log('🔄 Fetching line counts for camera:', currentCamera);
+    console.log('ð Fetching line counts for camera:', currentCamera);
     
     fetch(`/get_line_counts?camera_id=${currentCamera}`)
         .then(response => {
-            console.log('📡 Line counts API response status:', response.status);
+            console.log('ð¡ Line counts API response status:', response.status);
             return response.json();
         })
         .then(data => {
-            console.log('📊 Raw line counts data:', data);
+            console.log('ð Raw line counts data:', data);
             
-            // ✅ FIXED: Access line_counts directly from response
+            // â FIXED: Access line_counts directly from response
             const cameraLines = data.line_counts?.[currentCamera] || {};
-            console.log('🎯 Camera lines for', currentCamera, ':', cameraLines);
+            console.log('ð¯ Camera lines for', currentCamera, ':', cameraLines);
             
             let updatedCount = 0;
             for (const [lineName, countData] of Object.entries(cameraLines)) {
-                console.log(`📋 Processing ${lineName}:`, countData);
+                console.log(`ð Processing ${lineName}:`, countData);
                 
                 const inElement = document.getElementById(`${lineName}_in`);
                 const outElement = document.getElementById(`${lineName}_out`);
@@ -336,26 +337,26 @@ function updateLineCounts() {
                 if (inElement) {
                     const oldValue = inElement.textContent;
                     inElement.textContent = countData.in_count;
-                    console.log(`✅ Updated ${lineName}_in: ${oldValue} → ${countData.in_count}`);
+                    console.log(`â Updated ${lineName}_in: ${oldValue} â ${countData.in_count}`);
                     updatedCount++;
                 } else {
-                    console.error(`❌ Element ${lineName}_in not found in DOM`);
+                    console.error(`â Element ${lineName}_in not found in DOM`);
                 }
                 
                 if (outElement) {
                     const oldValue = outElement.textContent;
                     outElement.textContent = countData.out_count;
-                    console.log(`✅ Updated ${lineName}_out: ${oldValue} → ${countData.out_count}`);
+                    console.log(`â Updated ${lineName}_out: ${oldValue} â ${countData.out_count}`);
                     updatedCount++;
                 } else {
-                    console.error(`❌ Element ${lineName}_out not found in DOM`);
+                    console.error(`â Element ${lineName}_out not found in DOM`);
                 }
             }
             
-            console.log(`📋 Total line count elements updated: ${updatedCount}`);
+            console.log(`ð Total line count elements updated: ${updatedCount}`);
         })
         .catch(error => {
-            console.error('❌ Error fetching line counts:', error);
+            console.error('â Error fetching line counts:', error);
         });
 }
 
@@ -756,10 +757,12 @@ function initResetButtons() {
 }
 
 // Load line history for the active camera
-async function loadLineHistory(cameraId) {
+/*async function loadLineHistory(cameraId) {
   try {
     const res = await fetch(`/get_line_history/${cameraId}`);
     const data = await res.json();
+    
+    lineHistory[cameraId] = data.line_history || {};
 
     const tbody = document.querySelector("#line_history_table tbody");
     tbody.innerHTML = ""; // clear old rows
@@ -785,9 +788,61 @@ async function loadLineHistory(cameraId) {
       });
     }
   } catch (err) {
+    console.error("â Error fetching line history:", err);
+  }
+}*/
+
+async function loadLineHistory(cameraId) {
+  try {
+    const res = await fetch(`/get_line_history/${cameraId}`);
+    const data = await res.json();
+    
+    // Cache the raw data for the filtering system to use later
+    lineHistory[cameraId] = data.line_history || {};
+
+    const tbody = document.querySelector("#line_history_table tbody");
+    tbody.innerHTML = ""; // Clear old rows before adding new ones
+
+    // Handle case where there is no history data
+    if (!data.line_history || Object.keys(data.line_history).length === 0) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td colspan="4" style="text-align:center; color:gray;">No line history available</td>`;
+      tbody.appendChild(tr);
+      return;
+    }
+
+    // --- START OF THE FIX ---
+    // 1. Flatten all history entries from all lines into a single array
+    let allEntries = [];
+    for (const [lineName, history] of Object.entries(data.line_history)) {
+      history.forEach(entry => {
+        // Add the lineName to each entry so we know which line it belongs to
+        allEntries.push({ lineName, ...entry });
+      });
+    }
+
+    // 2. Sort the entire combined array by time, with the newest events first
+    allEntries.sort((a, b) => new Date(b.time) - new Date(a.time));
+    // --- END OF THE FIX ---
+
+    // 3. Loop through the newly sorted array and build the table rows
+    allEntries.forEach(entry => {
+        const tr = document.createElement("tr");
+        tr.className = entry.action.toLowerCase(); // "in" or "out" class
+        tr.innerHTML = `
+          <td>${entry.lineName}</td>
+          <td>${entry.id}</td>
+          <td>${entry.action}</td>
+          <td>${entry.time}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+  } catch (err) {
     console.error("❌ Error fetching line history:", err);
   }
-}
+} 
+
 
 // History filtering
 function initFilters() {
@@ -799,6 +854,13 @@ function initFilters() {
     resetFiltersBtn.addEventListener('click', resetFilters);
     exportCsvBtn.addEventListener('click', exportToCsv);
 }
+
+function initLineFilters() {
+    document.getElementById('apply-line-filters').addEventListener('click', applyLineFilters);
+    document.getElementById('reset-line-filters').addEventListener('click', resetLineFilters);
+    document.getElementById('export-line-csv').addEventListener('click', exportLineCsv);
+}
+
 
 function applyFilters() {
     const zoneFilter = document.getElementById('zone-filter').value;
@@ -947,6 +1009,116 @@ function exportToCsv() {
     document.body.removeChild(link);
 }
 
+
+
+
+function applyLineFilters() {
+    const lineNameFilter = document.getElementById('line-name-filter').value;
+    const actionFilter = document.getElementById('line-action-filter').value;
+    const dateFilter = document.getElementById('line-date-filter').value;
+    const timeFrom = document.getElementById('line-time-from').value;
+    const timeTo = document.getElementById('line-time-to').value;
+
+    let allLineHistory = [];
+    
+    // Use the cached data for filtering
+    if (lineHistory[currentCamera]) {
+        for (const [lineName, entries] of Object.entries(lineHistory[currentCamera])) {
+            entries.forEach(entry => {
+                allLineHistory.push({ lineName, ...entry });
+            });
+        }
+    }
+
+    let filteredHistory = allLineHistory;
+
+    if (lineNameFilter !== 'all') {
+        filteredHistory = filteredHistory.filter(entry => entry.lineName === lineNameFilter);
+    }
+    if (actionFilter !== 'all') {
+        filteredHistory = filteredHistory.filter(entry => entry.action.toLowerCase() === actionFilter);
+    }
+    if (dateFilter) {
+        const filterDate = new Date(dateFilter).setHours(0, 0, 0, 0);
+        filteredHistory = filteredHistory.filter(entry => new Date(entry.time).setHours(0, 0, 0, 0) === filterDate);
+    }
+    if (timeFrom) {
+        const [fromHours, fromMinutes] = timeFrom.split(':').map(Number);
+        filteredHistory = filteredHistory.filter(entry => {
+            const entryTime = new Date(entry.time);
+            return (entryTime.getHours() > fromHours || (entryTime.getHours() === fromHours && entryTime.getMinutes() >= fromMinutes));
+        });
+    }
+    if (timeTo) {
+        const [toHours, toMinutes] = timeTo.split(':').map(Number);
+        filteredHistory = filteredHistory.filter(entry => {
+            const entryTime = new Date(entry.time);
+            return (entryTime.getHours() < toHours || (entryTime.getHours() === toHours && entryTime.getMinutes() <= toMinutes));
+        });
+    }
+    
+    filteredHistory.sort((a, b) => new Date(b.time) - new Date(a.time));
+    updateFilteredLineTable(filteredHistory);
+}
+
+function updateFilteredLineTable(filteredHistory) {
+    const tableBody = document.getElementById('filtered_line_history_table').querySelector('tbody');
+    tableBody.innerHTML = '';
+    if (filteredHistory.length === 0) {
+        const row = document.createElement('tr');
+        row.innerHTML = '<td colspan="4" style="text-align:center;">No results found</td>';
+        tableBody.appendChild(row);
+        return;
+    }
+    filteredHistory.forEach(entry => {
+        const row = document.createElement('tr');
+        row.className = entry.action.toLowerCase();
+        row.innerHTML = `
+            <td>${entry.lineName}</td>
+            <td>${entry.id}</td>
+            <td>${entry.action}</td>
+            <td>${entry.time}</td>
+        `;
+        tableBody.appendChild(row);
+    });
+}
+
+function resetLineFilters() {
+    document.getElementById('line-name-filter').value = 'all';
+    document.getElementById('line-action-filter').value = 'all';
+    document.getElementById('line-date-filter').value = '';
+    document.getElementById('line-time-from').value = '';
+    document.getElementById('line-time-to').value = '';
+    document.getElementById('filtered_line_history_table').querySelector('tbody').innerHTML = '';
+}
+
+function exportLineCsv() {
+    const table = document.getElementById('filtered_line_history_table');
+    const rows = table.querySelectorAll('tr');
+    if (rows.length <= 1) {
+        showToast('No data to export');
+        return;
+    }
+    let csvContent = 'Line,ID,Action,Time\n';
+    for (let i = 1; i < rows.length; i++) {
+        const cells = rows[i].querySelectorAll('td');
+        if (cells.length === 4) {
+            const rowData = Array.from(cells).map(cell => `"${cell.textContent.replace(/"/g, '""')}"`);
+            csvContent += rowData.join(',') + '\n';
+        }
+    }
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `line_history_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+
+
 // Show toast message
 function showToast(message) {
     const toast = document.createElement('div');
@@ -975,6 +1147,7 @@ socket.on('connect', () => {
     loadCameras();
     loadZones();
     loadLines();
+    loadLineHistory(currentCamera);
 });
 
 socket.on('update_counts', (data) => {
@@ -1048,6 +1221,7 @@ socket.on('line_counts_updated', (data) => {
     }
 
     updateHistory();
+    loadLineHistory(currentCamera);
 
 
 });
@@ -1129,20 +1303,20 @@ function debugLineCountElements() {
     lineElements.forEach(id => {
         const element = document.getElementById(id);
         if (element) {
-            console.log(`✅ Element ${id} EXISTS, current value: "${element.textContent}"`);
+            console.log(`â Element ${id} EXISTS, current value: "${element.textContent}"`);
         } else {
-            console.error(`❌ Element ${id} MISSING from DOM`);
+            console.error(`â Element ${id} MISSING from DOM`);
         }
     });
 }
 
 debugLineCountElements();
 
-setInterval(() => {
+/*setInterval(() => {
   if (currentCamera) {
     loadLineHistory(currentCamera);
   }
-}, 5000);
+}, 5000);*/
 
 
 // Initialize application
@@ -1156,12 +1330,13 @@ function initializeApp() {
     initSnapshot();
     initResetButtons();
     initFilters();
+    initLineFilters();
     initializeSources();
     setupCanvas();
     //drawAllZones(ctx, canvasOverlay.width, canvasOverlay.height);
 
     setTimeout(() => {
-        console.log('🔄 Running startup debug...');
+        console.log('ð Running startup debug...');
         debugLineCountElements();
         updateLineCounts();
         updateLineBoxesVisibility();

@@ -1015,7 +1015,88 @@
             <tbody></tbody>
           </table>
         </div>
+        
+        <!-- NEW: Filtered Line History & Export -->
+        <div class="card">
+          <div class="card-header">
+            <h2>Filtered Line History</h2>
+          </div>
+          <!-- Notice the new IDs: "line-filter-controls", "line-zone-filter", etc. -->
+          <div class="filter-controls" id="line-filter-controls">
+            <div class="filter-group">
+              <label for="line-name-filter">
+                <i class="fas fa-filter"></i> Line:
+              </label>
+              <select id="line-name-filter">
+                <option value="all">All Lines</option>
+                <option value="line1">Line 1</option>
+                <option value="line2">Line 2</option>
+                <option value="line3">Line 3</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="line-action-filter">
+                <i class="fas fa-exchange-alt"></i> Action:
+              </label>
+              <select id="line-action-filter">
+                <option value="all">All Actions</option>
+                <option value="in">IN</option>
+                <option value="out">OUT</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="line-date-filter">
+                <i class="fas fa-calendar-alt"></i> Date:
+              </label>
+              <input type="date" id="line-date-filter" />
+            </div>
+            <div class="filter-group">
+              <label for="line-time-from">
+                <i class="fas fa-clock"></i> Time From:
+              </label>
+              <input type="time" id="line-time-from" />
+            </div>
+            <div class="filter-group">
+              <label for="line-time-to">
+                <i class="fas fa-clock"></i> Time To:
+              </label>
+              <input type="time" id="line-time-to" />
+            </div>
+            <div class="filter-buttons">
+              <button id="apply-line-filters">
+                <i class="fas fa-search"></i> Apply Line Filters
+              </button>
+              <button id="reset-line-filters" style="background-color: var(--gray);">
+                <i class="fas fa-times"></i> Reset Line Filters
+              </button>
+              <button id="export-line-csv" style="background-color: var(--success);">
+                <i class="fas fa-file-export"></i> Export Line History to CSV
+              </button>
+            </div>
+          </div>
+          <!-- Notice the new table ID -->
+          <table id="filtered_line_history_table">
+            <thead>
+              <tr>
+                <th>Line</th>
+                <th>ID</th>
+                <th>Action</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        
+        
+        
       </div>
+      
+      
+      
+      
+      
+      
 
       <div id="toast" class="toast">Message will appear here</div>
 
