@@ -5,31 +5,40 @@ import numpy as np
 import hailo
 import time
 import subprocess
-from gi.repository import Gst
+import logging
+from gi.repository import Gst, GLib
+from logging_config import get_logger
+import os
+
+logger = get_logger(__name__)
+
+PIPELINE_PARAMS = {
+    "input_width": 640,
+    "input_height": 640,
+
+    "input_framerate": 8,
+    "hailo_objects": ["hailonet"]
+}
+
 from hailo_apps_infra1.hailo_rpi_common import get_caps_from_pad, get_numpy_from_buffer
 from hailo_apps_infra1.detection_pipeline import GStreamerMultiSourceDetectionApp
-
 
 class SafeGStreamerMultiSourceDetectionApp(GStreamerMultiSourceDetectionApp):
     def __init__(self, *args, **kwargs):
         if threading.current_thread() == threading.main_thread():
             super().__init__(*args, **kwargs)
         else:
-            import signal as signal_module
-            original_signal = signal_module.signal
-            signal_module.signal = lambda *a, **kw: None
+            original_signal = signal.signal
+            signal.signal = lambda *a, **kw: None
             try:
                 super().__init__(*args, **kwargs)
             finally:
-                signal_module.signal = original_signal
-
+                signal.signal = original_signal
 
 def diagnose_rtsp_stream(rtsp_url):
-    """Diagnose RTSP stream using GStreamer tools"""
     print(f"Diagnosing RTSP stream: {rtsp_url}")
     
     try:
-        # Use gst-discoverer to analyze the stream
         cmd = [
             'gst-discoverer-1.0', 
             '-v', 
@@ -49,9 +58,7 @@ def diagnose_rtsp_stream(rtsp_url):
         print(f"gst-discoverer failed: {e}")
         return False
 
-
 def validate_rtsp_sources(sources, timeout=20):
-    """Enhanced RTSP validation specifically for DVR compatibility"""
     failed_sources = []
 
     for i, source in enumerate(sources):
@@ -61,13 +68,10 @@ def validate_rtsp_sources(sources, timeout=20):
 
         print(f"\n=== Validating camera{i+1}: {source} ===")
         
-        # First, diagnose the stream
         diagnose_rtsp_stream(source)
         
-        # Try multiple pipeline configurations
         validation_success = False
         
-        # Method 1: FFmpeg-based pipeline (most compatible with DVR)
         try:
             validation_success = _validate_with_ffmpeg_pipeline(source, i, timeout, failed_sources)
             if validation_success:
@@ -75,7 +79,6 @@ def validate_rtsp_sources(sources, timeout=20):
         except Exception as e:
             print(f"FFmpeg validation failed for camera{i+1}: {e}")
         
-        # Method 2: UDP instead of TCP
         if not validation_success:
             try:
                 validation_success = _validate_with_udp_pipeline(source, i, timeout, failed_sources)
@@ -84,7 +87,6 @@ def validate_rtsp_sources(sources, timeout=20):
             except Exception as e:
                 print(f"UDP validation failed for camera{i+1}: {e}")
         
-        # Method 3: Raw rtspsrc with minimal processing
         if not validation_success:
             try:
                 validation_success = _validate_with_raw_pipeline(source, i, timeout, failed_sources)
@@ -93,7 +95,6 @@ def validate_rtsp_sources(sources, timeout=20):
             except Exception as e:
                 print(f"Raw validation failed for camera{i+1}: {e}")
         
-        # Method 4: Force H.264 baseline profile
         if not validation_success:
             try:
                 validation_success = _validate_with_baseline_pipeline(source, i, timeout, failed_sources)
@@ -107,15 +108,13 @@ def validate_rtsp_sources(sources, timeout=20):
 
     if failed_sources:
         return False, "Some RTSP sources failed validation", failed_sources
-    return True, "All sources validated successfully", []
-
+    logger.info("RTSP validation logic is running (assuming success for this example).")
+    return True, "Sources assumed valid", []
 
 def _validate_with_ffmpeg_pipeline(source, camera_index, timeout, failed_sources):
-    """Use FFmpeg elements instead of native GStreamer RTSP"""
     try:
         print(f"Trying FFmpeg-based validation for camera{camera_index+1}...")
         
-        # Use avdec elements which are based on FFmpeg
         test_pipeline = Gst.parse_launch(f"""
             uridecodebin uri={source} ! 
             queue max-size-buffers=10 leaky=downstream ! 
@@ -131,9 +130,7 @@ def _validate_with_ffmpeg_pipeline(source, camera_index, timeout, failed_sources
         failed_sources.append(f"camera{camera_index+1}: FFmpeg validation exception: {str(e)}")
         return False
 
-
 def _validate_with_udp_pipeline(source, camera_index, timeout, failed_sources):
-    """Try UDP protocol instead of TCP"""
     try:
         print(f"Trying UDP validation for camera{camera_index+1}...")
         
@@ -160,9 +157,7 @@ def _validate_with_udp_pipeline(source, camera_index, timeout, failed_sources):
         failed_sources.append(f"camera{camera_index+1}: UDP validation exception: {str(e)}")
         return False
 
-
 def _validate_with_raw_pipeline(source, camera_index, timeout, failed_sources):
-    """Minimal processing pipeline"""
     try:
         print(f"Trying raw validation for camera{camera_index+1}...")
         
@@ -189,9 +184,7 @@ def _validate_with_raw_pipeline(source, camera_index, timeout, failed_sources):
         failed_sources.append(f"camera{camera_index+1}: Raw validation exception: {str(e)}")
         return False
 
-
 def _validate_with_baseline_pipeline(source, camera_index, timeout, failed_sources):
-    """Force H.264 baseline profile for DVR compatibility"""
     try:
         print(f"Trying baseline H.264 validation for camera{camera_index+1}...")
         
@@ -217,9 +210,7 @@ def _validate_with_baseline_pipeline(source, camera_index, timeout, failed_sourc
         failed_sources.append(f"camera{camera_index+1}: Baseline validation exception: {str(e)}")
         return False
 
-
 def _run_validation_pipeline(test_pipeline, camera_index, timeout, method_name):
-    """Common validation pipeline runner"""
     if not test_pipeline:
         print(f"{method_name} pipeline creation failed for camera{camera_index+1}")
         return False
@@ -229,7 +220,6 @@ def _run_validation_pipeline(test_pipeline, camera_index, timeout, method_name):
         test_pipeline.set_state(Gst.State.NULL)
         return False
 
-    # Enhanced bus monitoring
     bus = test_pipeline.get_bus()
     bus.add_signal_watch()
     
@@ -255,7 +245,6 @@ def _run_validation_pipeline(test_pipeline, camera_index, timeout, method_name):
                 
     bus.connect("message", on_bus_message)
 
-    # Start pipeline
     ret = test_pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
         test_pipeline.set_state(Gst.State.NULL)
@@ -278,18 +267,16 @@ def _run_validation_pipeline(test_pipeline, camera_index, timeout, method_name):
     appsink.set_property('emit-signals', True)
     appsink.connect('new-sample', on_new_sample)
 
-    # Wait for frames with longer timeout for DVR systems
     success = False
     while time.time() - start_time < timeout:
         if error_occurred:
             print(f"{method_name} validation failed due to error")
             break
             
-        # Check pipeline state
         ret, state, pending = test_pipeline.get_state(Gst.SECOND)
         
         if ret == Gst.StateChangeReturn.SUCCESS and state == Gst.State.PLAYING:
-            if frames_received >= 1:  # Just need 1 frame for DVR
+            if frames_received >= 1: 
                 success = True
                 break
         elif ret == Gst.StateChangeReturn.FAILURE:
@@ -298,7 +285,6 @@ def _run_validation_pipeline(test_pipeline, camera_index, timeout, method_name):
             
         time.sleep(0.5)
 
-    # Cleanup
     test_pipeline.set_state(Gst.State.NULL)
     bus.remove_signal_watch()
     
@@ -309,49 +295,46 @@ def _run_validation_pipeline(test_pipeline, camera_index, timeout, method_name):
     
     return success
 
-
-def create_visitor_counter_callback(user_data, frame_buffers, socketio):
+def create_visitor_counter_callback(user_data, frame_buffers, pipeline_manager=None):
     def visitor_counter_callback(pad, info, user_data_param):
         buffer = info.get_buffer()
-        if buffer is None:
-            print("Error: No buffer available")
+        if not buffer:
+            print("No buffer received in pad probe.")
             return Gst.PadProbeReturn.OK
 
         try:
             format, width, height = get_caps_from_pad(pad)
-            if format is None or width is None or height is None:
-                print("Error: Could not get format/dimensions from pad")
-                return Gst.PadProbeReturn.OK
-
-            np_frame = get_numpy_from_buffer(buffer, format, width, height)
-            frame = cv2.cvtColor(np_frame, cv2.COLOR_RGB2BGR)
-            camera_id = _extract_camera_id_from_pad(pad)
+            camera_id = pipeline_manager._extract_camera_id_from_pad(pad)
+            logger.debug(f"Processing frame from {camera_id} - Format: {format}, Size: {width}x{height}")
             detected_people = _extract_people_detections(buffer, width, height)
-            _draw_zones_on_frame(frame, user_data, camera_id)
-            frame_buffers[camera_id] = frame
+            
             user_data.update_counts(camera_id, detected_people)
-            socketio.emit("update_counts", {
-                "data": user_data.data,
-                "active_camera": user_data.active_camera
-            })
+            
+            np_frame = get_numpy_from_buffer(buffer, format, width, height)
+            frame_bgr = cv2.cvtColor(np_frame, cv2.COLOR_RGB2BGR)
+            _draw_visuals_on_frame(frame_bgr, user_data, camera_id)
+            
+            frame_buffers[camera_id] = frame_bgr
+
+            if pipeline_manager and hasattr(pipeline_manager, 'health_monitor'):
+                health_monitor = pipeline_manager.health_monitor
+                if health_monitor:
+                    health_monitor.update_frame_timestamp(camera_id)
+
+            try:
+                from pi_status_monitor import get_status_monitor
+                status_monitor = get_status_monitor(os.getenv("PI_UNIQUE_ID", "pi-default"))
+                status_monitor.update_frame_time()
+            except:
+                pass
+                
+
         except Exception as e:
-            print(f"Error in callback: {e}")
+            logger.error(f"Error in visitor_counter_callback: {e}", exc_info=False)
 
         return Gst.PadProbeReturn.OK
-
     return visitor_counter_callback
 
-
-def _extract_camera_id_from_pad(pad):
-    element = pad.get_parent_element()
-    element_name = element.get_name()
-    source_index = 0
-    if "identity_callback_" in element_name:
-        try:
-            source_index = int(element_name.split("identity_callback_")[-1])
-        except ValueError:
-            print(f"Couldn't parse source from {element_name}, defaulting to camera1")
-    return f"camera{source_index + 1}"
 
 
 def _extract_people_detections(buffer, width, height):
@@ -374,125 +357,217 @@ def _extract_people_detections(buffer, width, height):
             detected_people.add((person_id, center_x, center_y))
     return detected_people
 
-
-def _draw_zones_on_frame(frame, user_data, camera_id):
-    if camera_id not in user_data.data:
-        return
-    for zone, data in user_data.data[camera_id]["zones"].items():
-        top_left = tuple(map(int, data["top_left"]))
-        bottom_right = tuple(map(int, data["bottom_right"]))
-        cv2.rectangle(frame, top_left, bottom_right, (0, 0, 255), 2)
-        text = f"{zone} (In: {data['in_count']}, Out: {data['out_count']})"
-        cv2.putText(frame, text, (top_left[0], top_left[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
+def _draw_visuals_on_frame(frame, user_data, camera_id):
+    if camera_id not in user_data.data: return
+    with user_data.lock: 
+        for zone, data in user_data.data[camera_id].get("zones", {}).items():
+            top_left = tuple(map(int, data["top_left"]))
+            bottom_right = tuple(map(int, data["bottom_right"]))
+            cv2.rectangle(frame, top_left, bottom_right, (0, 0, 255), 2)
+    
+        for line_name, data in user_data.data[camera_id].get("lines", {}).items():
+            start_point = tuple(map(int, data["start"]))
+            end_point = tuple(map(int, data["end"]))
+            cv2.line(frame, start_point, end_point, (0, 255, 0), 2)
+            cv2.putText(frame, line_name, (start_point[0], start_point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
 class PipelineManager:
-    def __init__(self, user_data, frame_buffers, socketio):
+    def __init__(self, user_data, frame_buffers):
         self.user_data = user_data
         self.frame_buffers = frame_buffers
-        self.socketio = socketio
         self.app_instance = None
         self.video_sources = []
+        self.is_running_flag = False
+        self.bus = None
+        self.bus_watch_id = None
+        self.health_monitor = None
+        self.camera_names = []
+        logger.info("PipelineManager initialized.")
 
-    def start_pipeline(self, video_sources):
+    def _on_bus_message(self, bus, message):
+        msg_type = message.type
+        if msg_type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            logger.error(f"Gstreamer pipeline error: {err}, {debug}")
+            logger.warning("Critical pipeline erro detected. Attempting to restart the pipeline..")
+            self.trigger_restart()
+
+        elif msg_type == Gst.MessageType.EOS:
+            logger.info("End-of-Stream reached. Pipeline is stopping.")
+            logger.warning("Attempting to automatically restart the pipeline")
+            self.trigger_restart()
+        return True
+
+    def trigger_restart(self):
+        if hasattr(self, 'restart_thread') and self.restart_thread.is_alive():
+            logger.info("Restart already in progress. Skipping new restart request.")
+            return
+
+        self.restart_thread = threading.Thread(target=self.restart_pipeline, daemon=True)
+        self.restart_thread.start()
+
+    def restart_pipeline(self):
+        if self.is_running():
+            logger.info("Restarting pipeline...")
+            source_to_restart = self.video_sources.copy()
+
+            health_monitor_backup = self.health_monitor
+
+            self.stop_pipeline()
+            time.sleep(2)
+
+            self.health_monitor = health_monitor_backup
+
+            if source_to_restart:
+                self.start_pipeline(source_to_restart)
+            else:
+                logger.error("No video sources available to restart the pipeline.")
+
+    
+    def start_pipeline(self, video_sources, custom_camera_names=None, on_started_callback=None):
+        if custom_camera_names is None:
+            self.camera_names = [f"camera{i+1}" for i in range(len(video_sources))]
+        else:
+            if len(custom_camera_names) != len(video_sources):
+                raise ValueError("Length of custom_camera_names must equal length of video_sources.")
+            self.camera_names = custom_camera_names
+        
+        if self.is_running():
+            logger.info("Pipeline is already running. Stopping first.")
+            self.stop_pipeline()
+            time.sleep(1)
+
         try:
-            if self.app_instance:
-                print("Stopping previous pipeline before starting a new one...")
-                self.stop_pipeline()
-                time.sleep(1)
+            logger.info("Initializing fresh state for new pipeline...")
+            
+            if hasattr(self.user_data, 'initialize_sources'):
+                 self.user_data.initialize_sources(self.camera_names)
+            else:
+                 logger.warning("user_data object is missing the initialize_sources method.")
 
-            print("Validating RTSP sources...")
-            if self.socketio:
-                self.socketio.emit("pipeline_status", {
-                    "status": "validating",
-                    "message": "Validating RTSP sources..."
-                })
-
+            logger.info("Validating RTSP sources...")
             is_valid, message, failed_sources = validate_rtsp_sources(video_sources)
-
             if not is_valid:
-                print(f"RTSP validation failed: {failed_sources}")
-                if self.socketio:
-                    self.socketio.emit("pipeline_status", {
-                        "status": "error",
-                        "message": message,
-                        "details": failed_sources
-                    })
+                logger.error(f"RTSP validation failed: {message}, Details: {failed_sources}")
                 return False
 
-            print("RTSP sources validated successfully, creating main pipeline...")
-            if self.socketio:
-                self.socketio.emit("pipeline_status", {
-                    "status": "creating",
-                    "message": "Creating detection pipeline..."
-                })
-
+            logger.info("RTSP sources validated. Creating GStreamer pipeline...")
             self.video_sources = video_sources
 
-            camera_ids = [f"camera{i+1}" for i in range(len(video_sources))]
-            self.user_data.data = {cam_id: {"zones": {}} for cam_id in camera_ids}
-            self.user_data.inside_zones = {cam_id: {} for cam_id in camera_ids}
-            self.user_data.person_zone_history = {cam_id: {} for cam_id in camera_ids}
-            self.user_data.active_camera = camera_ids[0] if camera_ids else "camera1"
-            self.user_data.save_data()
+            callback = create_visitor_counter_callback(self.user_data, self.frame_buffers, self)
 
-            callback = create_visitor_counter_callback(self.user_data, self.frame_buffers, self.socketio)
-
-            self.app_instance = SafeGStreamerMultiSourceDetectionApp(callback, self.user_data, video_sources)
+            self.app_instance = SafeGStreamerMultiSourceDetectionApp(
+                callback, self.user_data, video_sources, self.user_data.data
+            )
             self.app_instance.create_pipeline()
 
+            self.bus = self.app_instance.pipeline.get_bus()
+            self.bus_watch_id = self.bus.add_watch(GLib.PRIORITY_DEFAULT, self._on_bus_message)
+
             for i in range(len(video_sources)):
-                identity_name = f"identity_callback{'' if i == 0 else '_' + str(i)}"
+                identity_name = f"identity_callback_{i}" if i > 0 else "identity_callback"
                 identity = self.app_instance.pipeline.get_by_name(identity_name)
                 if identity:
                     src_pad = identity.get_static_pad("src")
                     if src_pad:
-                        print(f"Adding pad probe to {identity_name}")
+                        logger.info(f"Adding pad probe to '{identity_name}'")
                         src_pad.add_probe(Gst.PadProbeType.BUFFER, callback, self.user_data)
+                else:
+                    logger.error(f"Could not find element '{identity_name}' to add a probe.")
 
             threading.Thread(target=self.app_instance.run, daemon=True).start()
+            self.is_running_flag = True
 
-            if self.socketio:
-                self.socketio.emit("pipeline_status", {
-                    "status": "running",
-                    "message": "Pipeline started successfully"
-                })
+            if self.health_monitor:
+                logger.info(f"Health monitor linked to pipeline")
+            else:
+                logger.warning("Health monitor not set in PipelineManager")
+            
+            if on_started_callback:
+                threading.Timer(2.0, on_started_callback, args=[self]).start()
 
-            print("Pipeline started successfully with validated sources")
+            try:
+                from pi_status_monitor import get_status_monitor
+                status_monitor = get_status_monitor(os.getenv("PI_UNIQUE_ID", "pi-default"))
+                if self.camera_names:
+                    cameras = self.camera_names
+                else:
+                    cameras = [f"camera{i+1}" for i in range(len(video_sources))]
+                
+                status_monitor.set_pipeline_status(True, cameras=cameras)
+            except Exception as e:
+                logger.warning(f"Could not update status monitor: {e}")
+                
+            logger.info("Pipeline started successfully")
+            return True
+
+
+        except Exception as e:
+            logger.error(f"Failed to start pipeline: {e}", exc_info=True)
+            self.is_running_flag = False
+            return False
+
+
+    def _extract_camera_id_from_pad(self, pad):
+        element = pad.get_parent_element()
+        element_name = element.get_name()
+        source_index = 0
+        if "identity_callback_" in element_name:
+            try:
+                source_index = int(element_name.split("identity_callback_")[-1])
+            except ValueError:
+                print(f"Couldn't parse source from {element_name}, defaulting to 0")
+        if 0 <= source_index < len(self.camera_names):
+            return self.camera_names[source_index]
+        else:
+            logger.warning(f"Source index {source_index} out of range, defaulting camera name to 'unknown_camera'")
+            return "unknown_camera"
+
+    def stop_pipeline(self):
+        if not self.is_running():
+            logger.info("Stop command received, but no pipeline was running.")
+            return True
+        logger.info("Stopping pipeline...")
+        try:
+            if self.bus_watch_id:
+                GLib.source_remove(self.bus_watch_id)
+                self.bus_watch_id = None
+
+            if self.app_instance and hasattr(self.app_instance, 'pipeline'):
+                self.app_instance.pipeline.send_event(Gst.Event.new_eos())
+                time.sleep(0.5)
+                ret = self.app_instance.pipeline.set_state(Gst.State.NULL)
+
+                if ret != Gst.StateChangeReturn.SUCCESS:
+                    ret, state, pending = self.app_instance.pipeline.get_state(3*Gst.SECOND)
+                    if ret == Gst.StateChangeReturn.SUCCESS:
+                        logger.info("Pipeline stopped successfully after EOS.")
+                    else:
+                        logger.warning("Pipeline did not stop cleanly after EOS.")
+                time.sleep(0.5)
+                 
+            self.app_instance = None
+            self.frame_buffers.clear()
+            self.video_sources = []
+            self.is_running_flag = False
+
+            try:
+                from pi_status_monitor import get_status_monitor
+                status_monitor = get_status_monitor(os.getenv("PI_UNIQUE_ID", "pi-default"))
+                status_monitor.set_pipeline_status(False)
+            except Exception as e:
+                logger.warning(f"Could not update status monitor: {e}")
+
+            logger.info("Pipeline stopped successfully.")
             return True
 
         except Exception as e:
-            error_msg = f"Failed to start pipeline: {str(e)}"
-            print(error_msg)
-            if self.socketio:
-                self.socketio.emit("pipeline_status", {
-                    "status": "error",
-                    "message": error_msg
-                })
+            logger.error(f"Error during pipeline shutdown: {e}", exc_info=True)
+            self.app_instance = None
+            self.frame_buffers.clear()
+            self.video_sources = []
+            self.is_running_flag = False
             return False
 
-    def stop_pipeline(self):
-        if self.app_instance:
-            try:
-                self.app_instance.pipeline.set_state(Gst.State.NULL)
-                self.app_instance = None
-                self.frame_buffers.clear()
-                if self.socketio:
-                    self.socketio.emit("pipeline_status", {
-                        "status": "stopped",
-                        "message": "Pipeline stopped successfully"
-                    })
-                return True
-            except Exception as e:
-                error_msg = f"Error stopping pipeline: {e}"
-                print(error_msg)
-                if self.socketio:
-                    self.socketio.emit("pipeline_status", {
-                        "status": "error",
-                        "message": error_msg
-                    })
-                return False
-        return True
-
     def is_running(self):
-        return self.app_instance is not None
+        return self.app_instance is not None and self.is_running_flag
