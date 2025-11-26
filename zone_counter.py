@@ -1,799 +1,1125 @@
-"""
-Enhanced Multi-Camera Zone Visitor Counter
-- Uses raw person IDs without camera prefixes
-- Maintains complete camera isolation through separate tracking structures
-- Includes dwell time requirements and state stability checks
-- Fixed camera switching and snapshot functionality
-"""
-
 import json
 import datetime
 import numpy as np
-from typing import Dict, Set, List, Tuple, Any, Optional
-from hailo_apps_infra.hailo_rpi_common import app_callback_class
-from config import HISTORY_FILE, DEFAULT_ZONE_CONFIG
+import time
+import threading
+import logging
+from typing import Dict, Set, List, Tuple, Any, Optional, Union
+from dataclasses import dataclass
+from collections import defaultdict
+from enum import Enum
+from hailo_apps_infra1.hailo_rpi_common import app_callback_class
+from config import save_zone_line_config
+from logging_config import get_logger
+from database_writer import get_database_writer
+
+
+logging.basicConfig(level=logging.INFO)
+logger = get_logger(__name__)
+
+
+class PersonState(Enum):
+    INSIDE = "inside"
+    OUTSIDE = "outside"
+    ENTERING = "entering"
+    EXITING = "exiting"
+
+
+class ActionType(Enum):
+    ENTRY = "Entered"
+    EXIT = "Exited"
+    IN = "In"
+    OUT = "Out"
+
+
+@dataclass
+class CounterConfig:
+    frame_height: int = 1080
+    frame_width: int = 1920
+    zone_padding: int = 30
+    min_dwell_frames: int = 3
+    min_dwell_time: float = 1.0
+    exit_grace_time: float = 1.0
+    crossing_cooldown_seconds: float = 2.0
+    min_movement_threshold: float = 5.0
+    state_confirmation_frames: int = 3
+    max_history_entries: int = 1000
+    cleanup_interval_minutes: int = 5
 
 
 class MultiSourceZoneVisitorCounter(app_callback_class):
-    def __init__(self):
+    def __init__(self, mqtt_client=None, pi_id: str = "pi-default", config: Optional[CounterConfig] = None):
         super().__init__()
-        print("[INFO] Initializing MultiSourceZoneVisitorCounter")
-        self.frame_height = 1080
-        self.frame_width = 1920
-        
-        # Tracking structures - all camera-specific
-        self.data = self.load_data()
-        self.inside_zones = {}          # {camera_id: {zone: set(person_ids)}}
-        self.person_zone_history = {}   # {camera_id: {zone: {person_id: history}}}
-        self.person_state_buffer = {}   # {camera_id: {zone: {person_id: state_data}}}
-        self.person_dwell_tracker = {}  # {camera_id: {zone: {person_id: dwell_data}}}
-        
-        # Configuration
-        self.zone_padding = 30          # pixels buffer inside zone boundaries
-        self.min_dwell_frames = 3       # frames for stable state
-        self.bbox_overlap_threshold = 0.3
-        self.min_dwell_time = 1.0      # seconds required in zone before counting
-        self.exit_grace_time = 1.0     # seconds to wait before confirming exit
-        self.line_gate_width = 150
+        logger.info("Initializing MultiSourceZoneVisitorCounter")
+        self.config = config or CounterConfig()
+        self.mqtt_client = mqtt_client
+        self.pi_id = pi_id
 
-        # Initialize structures for existing cameras
-        for camera_id in self.data:
-            self._init_camera(camera_id)
-        
-        self.active_camera = list(self.data.keys())[0] if self.data else "camera1"
-        self.lines = {}  # {camera_id: {line_name: line_data}}
-        self.line_cross_tracker = {}  # {camera_id: {line_name: set(person_ids)}}
-        self.line_cooldown_tracker = {}
-        self.crossing_cooldown_seconds = 2.0
-        self.min_movement_threshold = 5.0  # pixels
-        self.state_confirmation_frames = 3
+        self.db_writer = get_database_writer(batch_size=50, batch_interval=2.0)
+        self.db_enabled = False
+
+        self.lock = threading.Lock()
+        self.data: Dict[str, Dict[str, Any]] = {}
+
+        self.inside_zones: Dict[str, Dict[str, Set[int]]] = {}
+        self.person_state_buffer: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+        self.person_dwell_tracker: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+        self.line_cross_tracker: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+        self.line_cooldown_tracker: Dict[str, Dict[str, Dict[int, datetime.datetime]]] = {}
+
+        self.person_zone_history: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+
+        self.active_camera: str = "camera1"
+
+        self.last_cleanup = datetime.datetime.now()
+
+    def _validate_coordinates(self, top_left: List[int], bottom_right: List[int]) -> bool:
+        try:
+            if len(top_left) != 2 or len(bottom_right) != 2:
+                return False
+            if top_left[0] >= bottom_right[0] or top_left[1] >= bottom_right[1]:
+                return False
+            if any(coord < 0 for coord in top_left + bottom_right):
+                return False
+            if (bottom_right[0] > self.config.frame_width or
+                    bottom_right[1] > self.config.frame_height):
+                return False
+            return True
+        except (TypeError, IndexError):
+            return False
+
+    def _validate_line_coordinates(self, start: List[int], end: List[int]) -> bool:
+        try:
+            if len(start) != 2 or len(end) != 2:
+                return False
+            if any(coord < 0 for coord in start + end):
+                return False
+            if (max(start[0], end[0]) > self.config.frame_width or
+                    max(start[1], end[1]) > self.config.frame_height):
+                return False
+            distance = np.sqrt((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2)
+            return distance >= 10
+        except (TypeError, IndexError):
+            return False
+
+    def _validate_person_data(self, person_data: Tuple) -> bool:
+        if len(person_data) == 5:
+            try:
+                person_id, x1, y1, x2, y2 = person_data
+                return (isinstance(person_id, (int, str)) and
+                        all(isinstance(coord, (int, float)) for coord in [x1, y1, x2, y2]) and
+                        x1 < x2 and y1 < y2)
+            except (ValueError, TypeError):
+                return False
+        elif len(person_data) == 3:
+            try:
+                person_id, x, y = person_data
+                return (isinstance(person_id, (int, str)) and
+                        isinstance(x, (int, float)) and isinstance(y, (int, float)))
+            except (ValueError, TypeError):
+                return False
+        return False
 
     def _init_camera(self, camera_id: str) -> None:
-        """Initialize all tracking structures for a camera."""
-        self.inside_zones[camera_id] = {}
-        self.person_zone_history[camera_id] = {}
-        self.person_state_buffer[camera_id] = {}
-        self.person_dwell_tracker[camera_id] = {}
-        
-        for zone in self.data[camera_id]["zones"]:
-            self.inside_zones[camera_id][zone] = set()
-            self.person_zone_history[camera_id][zone] = {}
-            self.person_state_buffer[camera_id][zone] = {}
-            self.person_dwell_tracker[camera_id][zone] = {}
-
-    def load_data(self) -> Dict[str, Any]:
-        """Load zone configurations from file or initialize defaults."""
         try:
-            with open(HISTORY_FILE, "r") as f:
-                raw_data = json.load(f)
-                self.lines = raw_data.get("_lines", {})
-                return {k: v for k, v in raw_data.items() if not k.startswith("_")}
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.lines = {}
-            return {"camera1": {"zones": DEFAULT_ZONE_CONFIG.copy()}}
+            self.inside_zones[camera_id] = defaultdict(set)
+            self.person_state_buffer[camera_id] = defaultdict(dict)
+            self.person_dwell_tracker[camera_id] = defaultdict(dict)
+            self.line_cross_tracker[camera_id] = defaultdict(dict)
+            self.line_cooldown_tracker[camera_id] = defaultdict(dict)
+            self.person_zone_history[camera_id] = defaultdict(dict)
 
-    def save_data(self) -> None:
-        """Persist zone configurations and counts."""
-        try:
-            data_to_save = self.data.copy()
-            data_to_save["_lines"] = self.lines
-            with open(HISTORY_FILE, "w") as f:
-                json.dump(data_to_save, f, indent=4)
+            for zone in self.data[camera_id].get("zones", {}):
+                self.inside_zones[camera_id][zone] = set()
+                self.person_state_buffer[camera_id][zone] = {}
+                self.person_dwell_tracker[camera_id][zone] = {}
+                self.person_zone_history[camera_id][zone] = {}
+
+            for line in self.data[camera_id].get("lines", {}):
+                self.line_cross_tracker[camera_id][line] = {}
+                self.line_cooldown_tracker[camera_id][line] = {}
+
+            logger.info(f"Initialized camera tracking structures: {camera_id}")
         except Exception as e:
-            print(f"[ERROR] Failed to save data: {e}")
+            logger.error(f"Failed to initialize camera {camera_id}: {e}")
+            raise
 
-    def is_inside_zone(self, x: float, y: float, top_left: List[int], bottom_right: List[int]) -> bool:
-        """Check if a point (x, y) is inside the defined zone - for compatibility."""
-        return top_left[0] <= x <= bottom_right[0] and top_left[1] <= y <= bottom_right[1]
-
-    def _is_in_zone(self, point: Tuple[float, float], zone_coords: Tuple[List[int], List[int]]) -> bool:
-        """Check if point is inside zone with padding."""
-        x, y = point
-        (x1, y1), (x2, y2) = zone_coords
-        
-        # Apply padding (shrinking zone inward)
-        px1 = x1 + self.zone_padding
-        py1 = y1 + self.zone_padding
-        px2 = x2 - self.zone_padding
-        py2 = y2 - self.zone_padding
-        
-        # Fallback to original zone if padding makes it invalid
-        if px1 >= px2 or py1 >= py2:
-            return x1 <= x <= x2 and y1 <= y <= y2
-        return px1 <= x <= px2 and py1 <= y <= py2
-
-    def _get_person_position(self, person_data: Tuple, method: str = "bottom_center") -> Tuple[float, float]:
-        """Extract position from person data based on detection method."""
-        if len(person_data) == 5:  # (id, x1, y1, x2, y2)
-            _, x1, y1, x2, y2 = person_data
-            if method == "bottom_center":
-                return (x1 + x2) / 2, y2
-            elif method == "center":
-                return (x1 + x2) / 2, (y1 + y2) / 2
-        elif len(person_data) == 3:  # (id, x, y)
-            _, x, y = person_data
-            return x, y
-        return 0.0, 0.0
-
-    def update_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
-        """Main update method for processing detections and updating counts."""
-        try:
-            # Initialize camera if new
-            if camera_id not in self.data:
-                self.data[camera_id] = {"zones": DEFAULT_ZONE_CONFIG.copy()}
+    def initialize_sources(self, camera_ids: List[str]):
+        with self.lock:
+            for camera_id in camera_ids:
+                if camera_id not in self.data:
+                    self.data[camera_id] = {"zones": {}, "lines": {}}
+                    logger.info(f"Initialized new camera: {camera_id}")
+                else:
+                    for zone_name, zone_data in self.data[camera_id].get("zones", {}).items():
+                        zone_data["inside_ids"] = []
+                        logger.info(f"Preserved counts for {camera_id}/{zone_name}:")
+                    
+                    for line_name, line_data in self.data[camera_id].get("lines", {}).items():
+                        logger.info(f"Preserved counts for {camera_id}/{line_name}:")
                 self._init_camera(camera_id)
             
-            active_ids = {p[0] for p in detected_people if len(p) >= 1}
+            logger.info(f"[INFO] Cleared all old data. Initialized fresh state for cameras:{camera_ids}")
+
+    def _clear_trackers(self) -> None:
+        self.inside_zones.clear()
+        self.person_state_buffer.clear()
+        self.person_dwell_tracker.clear()
+        self.line_cross_tracker.clear()
+        self.line_cooldown_tracker.clear()
+
+    def get_active_cameras_info(self) -> Dict[str, Any]:
+        with self.lock:
+            camera_list = []
+            for camera_id in self.data.keys():
+                camera_info = {
+                    "camera_id": camera_id,
+                    "status": "active",
+                    "zones": list(self.data[camera_id].get("zones", {}).keys()),
+                    "lines": list(self.data[camera_id].get("lines", {}).keys()),
+                    "zone_count": len(self.data[camera_id].get("zones", {})),
+                    "line_count": len(self.data[camera_id].get("lines", {}))
+                }
+                camera_list.append(camera_info)
+
+            return {
+                "cameras": camera_list,
+                "total": len(camera_list),
+                "timestamp": time.time(),
+                "status": "active"
+            }
+
+    def _is_in_zone(self, point: Tuple[float, float], zone_coords: Tuple[List[int], List[int]]) -> bool:
+        try:
+            x, y = point
+            (x1, y1), (x2, y2) = zone_coords
+
+            px1 = x1 + self.config.zone_padding
+            py1 = y1 + self.config.zone_padding
+            px2 = x2 - self.config.zone_padding
+            py2 = y2 - self.config.zone_padding
+
+            if px1 >= px2 or py1 >= py2:
+                return x1 <= x <= x2 and y1 <= y <= y2
+
+            return px1 <= x <= px2 and py1 <= y <= py2
+
+        except (ValueError, TypeError, IndexError) as e:
+            logger.warning(f"Invalid zone check parameters: {e}")
+            return False
+
+    def _get_person_position(self, person_data: Tuple, method: str = "center") -> Tuple[float, float]:
+        try:
+            if len(person_data) == 5:
+                _, x1, y1, x2, y2 = person_data
+                if method == "bottom_center":
+                    return (x1 + x2) / 2, y2
+                elif method == "center":
+                    return (x1 + x2) / 2, (y1 + y2) / 2
+            elif len(person_data) == 3:
+                _, x, y = person_data
+                return float(x), float(y)
+        except (ValueError, TypeError, IndexError) as e:
+            logger.warning(f"Failed to extract person position: {e}")
+
+        return 0.0, 0.0
+
+    def _update_state_buffer(self, camera_id: str, zone: str, person_id: int, is_inside: bool) -> bool:
+        try:
+            buffer = self.person_state_buffer[camera_id][zone]
             current_time = datetime.datetime.now()
-            
-            # Process each zone for this camera
-            for zone, zone_data in self.data[camera_id]["zones"].items():
+
+            if person_id not in buffer:
+                buffer[person_id] = {
+                    'state': is_inside,
+                    'count': 1,
+                    'last_update': current_time
+                }
+                return False
+
+            data = buffer[person_id]
+            if data['state'] != is_inside:
+                data.update({
+                    'state': is_inside,
+                    'count': 1,
+                    'last_update': current_time
+                })
+                return False
+            else:
+                data['count'] += 1
+                data['last_update'] = current_time
+                return data['count'] >= self.config.min_dwell_frames
+
+        except Exception as e:
+            logger.error(f"Error updating state buffer: {e}")
+            return False
+
+    def _update_dwell_tracker(self, camera_id: str, zone: str, person_id: int,
+                              is_inside: bool, current_time: datetime.datetime) -> Dict[str, Any]:
+        try:
+            tracker = self.person_dwell_tracker[camera_id][zone]
+
+            if person_id not in tracker:
+                if is_inside:
+                    tracker[person_id] = {
+                        'entry_time': current_time,
+                        'last_seen': current_time,
+                        'counted': False,
+                        'exit_time': None,
+                        'state': PersonState.INSIDE.value
+                    }
+                    return {'action': 'entered', 'dwell_time': 0.0, 'should_count': False}
+                return {'action': 'none', 'dwell_time': 0.0, 'should_count': False}
+
+            entry = tracker[person_id]
+
+            if is_inside:
+                if entry['state'] == PersonState.EXITING.value:
+                    entry.update({
+                        'state': PersonState.INSIDE.value,
+                        'exit_time': None,
+                        'last_seen': current_time
+                    })
+                    return {'action': 're_entered', 'dwell_time': 0.0, 'should_count': False}
+
+                entry['last_seen'] = current_time
+                dwell_time = (current_time - entry['entry_time']).total_seconds()
+
+                if not entry['counted'] and dwell_time >= self.config.min_dwell_time:
+                    entry['counted'] = True
+                    return {
+                        'action': 'qualified_entry',
+                        'dwell_time': dwell_time,
+                        'should_count': True
+                    }
+
+                return {'action': 'dwelling', 'dwell_time': dwell_time, 'should_count': False}
+
+            else:
+                if entry['state'] == PersonState.INSIDE.value:
+                    entry.update({
+                        'state': PersonState.EXITING.value,
+                        'exit_time': current_time
+                    })
+                    dwell_time = (current_time - entry['entry_time']).total_seconds()
+                    return {
+                        'action': 'exiting',
+                        'dwell_time': dwell_time,
+                        'should_count': entry['counted']
+                    }
+
+                elif entry['state'] == PersonState.EXITING.value:
+                    exit_duration = (current_time - entry['exit_time']).total_seconds()
+                    if exit_duration >= self.config.exit_grace_time:
+                        dwell_time = (entry['exit_time'] - entry['entry_time']).total_seconds()
+                        should_count = entry['counted']
+                        del tracker[person_id]
+                        return {
+                            'action': 'confirmed_exit',
+                            'dwell_time': dwell_time,
+                            'should_count': should_count
+                        }
+                return {'action': 'outside', 'dwell_time': 0.0, 'should_count': False}
+
+        except Exception as e:
+            logger.error(f"Error updating dwell tracker: {e}")
+            return {'action': 'error', 'dwell_time': 0.0, 'should_count': False}
+
+    def _get_side_of_line(self, point: np.ndarray, line_start: np.ndarray, line_end: np.ndarray) -> int:
+        try:
+            line_vec = line_end - line_start
+            point_vec = point - line_start
+            cross_product_z = line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0]
+            return int(np.sign(cross_product_z))
+        except Exception as e:
+            logger.warning(f"Error calculating line side: {e}")
+            return 0
+
+    def _trim_history(self, history: List[Dict], max_entries: int = None) -> List[Dict]:
+        max_entries = max_entries or self.config.max_history_entries
+        if len(history) > max_entries:
+            return history[-max_entries:]
+        return history
+
+    def _publish_mqtt_event(self, topic: str, payload: Dict[str, Any]) -> None:
+        try:
+            if self.mqtt_client:
+                self.mqtt_client.publish(topic, json.dumps(payload), qos=1)
+        except Exception as e:
+            logger.error(f"Failed to publish MQTT message: {e}")
+
+    def update_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
+        if not camera_id or not isinstance(detected_people, (set, list)):
+            logger.warning(f"Invalid parameters: camera_id={camera_id}, people type={type(detected_people)}")
+            return
+
+        valid_people = set()
+        for person_data in detected_people:
+            if self._validate_person_data(person_data):
+                valid_people.add(person_data)
+            else:
+                logger.warning(f"Invalid person data: {person_data}")
+
+        with self.lock:
+            try:
+                if camera_id not in self.data:
+                    logger.warning(f"Initializing unknown camera: {camera_id}")
+                    self.data[camera_id] = {"zones": {}, "lines": {}}
+                    self._init_camera(camera_id)
+
+                active_ids = {p[0] for p in valid_people if len(p) >= 1}
+                current_time = datetime.datetime.now()
+
+                self._process_zones(camera_id, valid_people, active_ids, current_time)
+
+                self._process_lines(camera_id, valid_people, current_time, active_ids)
+
+                if (current_time - self.last_cleanup).total_seconds() > (self.config.cleanup_interval_minutes * 60):
+                    self._perform_cleanup()
+                    self.last_cleanup = current_time
+
+            except Exception as e:
+                logger.error(f"Failed to update counts for {camera_id}: {e}")
+                raise
+
+    def _process_zones(self, camera_id: str, detected_people: Set[Tuple],
+                       active_ids: Set[int], current_time: datetime.datetime) -> None:
+        for zone, zone_data in self.data[camera_id].get("zones", {}).items():
+            try:
                 zone_coords = (zone_data["top_left"], zone_data["bottom_right"])
                 current_inside = set()
                 entries_to_count = []
                 exits_to_count = []
-                
-                # Check each person against this zone
+
                 for person_data in detected_people:
-                    if len(person_data) < 1:
-                        continue
-                        
                     person_id = person_data[0]
-                    position = self._get_person_position(person_data)
+                    position = self._get_person_position(person_data, method="center")
                     is_inside = self._is_in_zone(position, zone_coords)
-                    
-                    # Update state buffer and check stability
+
                     if self._update_state_buffer(camera_id, zone, person_id, is_inside):
                         if is_inside:
                             current_inside.add(person_id)
-                        
-                        # Update dwell tracking
-                        dwell_result = self._update_dwell_tracker(
-                            camera_id, zone, person_id, is_inside, current_time
-                        )
-                        
+
+                        dwell_result = self._update_dwell_tracker(camera_id, zone, person_id, is_inside, current_time)
+
                         if dwell_result['should_count']:
                             if dwell_result['action'] == 'qualified_entry':
                                 entries_to_count.append(person_id)
                             elif dwell_result['action'] == 'confirmed_exit':
                                 exits_to_count.append(person_id)
-                
-                # Check for people who left the frame entirely
-                for person_id in list(self.person_dwell_tracker[camera_id][zone].keys()):
+
+                for person_id in list(self.person_dwell_tracker[camera_id].get(zone, {}).keys()):
                     if person_id not in active_ids:
-                        dwell_result = self._update_dwell_tracker(
-                            camera_id, zone, person_id, False, current_time
-                        )
+                        dwell_result = self._update_dwell_tracker(camera_id, zone, person_id, False, current_time)
                         if dwell_result['should_count'] and dwell_result['action'] == 'confirmed_exit':
                             exits_to_count.append(person_id)
-                
-                # Apply count updates
-                timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
+
+                timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
+
                 if entries_to_count:
                     zone_data["in_count"] += len(entries_to_count)
                     for pid in entries_to_count:
-                        zone_data["history"].append({
-                            "id": pid, "action": "Entered", "time": timestamp
-                        })
-                
+                        history_entry = {"id": pid, "action": ActionType.ENTRY.value, "time": timestamp_str}
+                        zone_data["history"].append(history_entry)
+
+                        topic = f"vision/{self.pi_id}/{camera_id}/history/zone/entry"
+                        payload = {"zone": zone, **history_entry}
+                        self._publish_mqtt_event(topic, payload)
+
+                        if self.db_enabled and self.db_writer:
+                            try:
+                                person_position = None
+                                for person_data in detected_people:
+                                    if person_data[0] == pid:
+                                        person_position = self._get_person_position(person_data, method="center")
+                                        break
+                                if person_position:
+                                    self.db_writer.write_zone_event(
+                                        camera_id=camera_id,
+                                        zone_name=zone,
+                                        person_id=pid,
+                                        action="Entered",
+                                        x=person_position[0],
+                                        y=person_position[1],
+                                        pi_id=self.pi_id
+                                    )
+
+                                    try:
+                                        from pi_status_monitor import get_status_monitor
+                                        status_monitor = get_status_monitor(self.pi_id)
+                                        status_monitor.increment_event_count()
+                                    except:
+                                        pass
+
+                            except Exception as e:
+                                logger.error(f"Failed to write zone entry event to DB: {e}")
+
                 if exits_to_count:
                     zone_data["out_count"] += len(exits_to_count)
                     for pid in exits_to_count:
-                        zone_data["history"].append({
-                            "id": pid, "action": "Exited", "time": timestamp
-                        })
-                
-                # Update current occupancy
+                        history_entry = {"id": pid, "action": ActionType.EXIT.value, "time": timestamp_str}
+                        zone_data["history"].append(history_entry)
+
+                        topic = f"vision/{self.pi_id}/{camera_id}/history/zone/exit"
+                        payload = {"zone": zone, **history_entry}
+                        self._publish_mqtt_event(topic, payload)
+
+                        if self.db_enabled and self.db_writer:
+                            try:
+                                dwell_time_value = None
+                                if (camera_id in self.person_dwell_tracker and zone in self.person_dwell_tracker[camera_id]):
+                                    tracker_data = self.person_dwell_tracker[camera_id][zone].get(pid)
+                                    if tracker_data and 'entry_time' in tracker_data:
+                                        dwell_time_value = (current_time - tracker_data['entry_time']).total_seconds()
+
+
+                                person_position = None
+                                for person_data in detected_people:
+                                    if person_data[0] == pid:
+                                        person_position = self._get_person_position(person_data, method="center")
+                                        break
+
+                                if not person_position:
+                                    zone_data_coords = zone_data
+                                    tl = zone_data_coords["top_left"]
+                                    br = zone_data_coords["bottom_right"]
+                                    person_position = ((tl[0] + br[0]) / 2, (tl[1] + br[1]) / 2)
+
+
+                                self.db_writer.write_zone_event(
+                                    camera_id=camera_id,
+                                    zone_name=zone,
+                                    person_id=pid,
+                                    action="Exited",
+                                    x=person_position[0],
+                                    y=person_position[1],
+                                    pi_id=self.pi_id,
+                                    dwell_time=dwell_time_value
+                                )
+
+                                try:
+                                    from pi_status_monitor import get_status_monitor
+                                    status_monitor = get_status_monitor(self.pi_id)
+                                    status_monitor.increment_event_count()
+                                except:
+                                    pass
+
+                            except Exception as e:
+                                logger.error(f"Failed to write zone exit event to DB: {e}")
+
                 self.inside_zones[camera_id][zone] = current_inside
                 zone_data["inside_ids"] = list(current_inside)
-            
-            self.update_line_counts(camera_id, detected_people)
 
-            self.save_data()
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to update counts for {camera_id}: {e}")
+                zone_data["history"] = self._trim_history(zone_data["history"])
 
-    def _update_state_buffer(self, camera_id: str, zone: str, 
-                           person_id: int, is_inside: bool) -> bool:
-        """Update state buffer and return True if state is stable."""
-        buffer = self.person_state_buffer[camera_id][zone]
-        
-        if person_id not in buffer:
-            buffer[person_id] = {
-                'state': is_inside,
-                'count': 1,
-                'last_update': datetime.datetime.now()
-            }
-            return False
-        
-        data = buffer[person_id]
-        if data['state'] != is_inside:
-            data.update({
-                'state': is_inside,
-                'count': 1,
-                'last_update': datetime.datetime.now()
-            })
-            return False
-        else:
-            data['count'] += 1
-            data['last_update'] = datetime.datetime.now()
-            return data['count'] >= self.min_dwell_frames
+            except Exception as e:
+                logger.error(f"Error processing zone {zone}: {e}")
 
-    def _update_dwell_tracker(self, camera_id: str, zone: str, 
-                            person_id: int, is_inside: bool, 
-                            current_time: datetime.datetime) -> Dict[str, Any]:
-        """Update dwell tracking and return count eligibility."""
-        tracker = self.person_dwell_tracker[camera_id][zone]
-        
-        # Initialize new entry
-        if person_id not in tracker:
-            if is_inside:
-                tracker[person_id] = {
-                    'entry_time': current_time,
-                    'last_seen': current_time,
-                    'counted': False,
-                    'exit_time': None,
-                    'state': 'inside'
-                }
-                return {'action': 'entered', 'dwell_time': 0.0, 'should_count': False}
-            return {'action': 'none', 'dwell_time': 0.0, 'should_count': False}
-        
-        entry = tracker[person_id]
-        
-        # Handle current inside state
-        if is_inside:
-            if entry['state'] == 'exiting':  # Re-entered during grace period
-                entry.update({
-                    'state': 'inside',
-                    'exit_time': None,
-                    'last_seen': current_time
-                })
-                return {'action': 're_entered', 'dwell_time': 0.0, 'should_count': False}
-            
-            entry['last_seen'] = current_time
-            dwell_time = (current_time - entry['entry_time']).total_seconds()
-            
-            if not entry['counted'] and dwell_time >= self.min_dwell_time:
-                entry['counted'] = True
-                return {
-                    'action': 'qualified_entry',
-                    'dwell_time': dwell_time,
-                    'should_count': True
-                }
-            
-            return {'action': 'dwelling', 'dwell_time': dwell_time, 'should_count': False}
-        
-        # Handle current outside state
-        else:
-            if entry['state'] == 'inside':  # Just exited
-                entry.update({
-                    'state': 'exiting',
-                    'exit_time': current_time
-                })
-                dwell_time = (current_time - entry['entry_time']).total_seconds()
-                return {
-                    'action': 'exiting',
-                    'dwell_time': dwell_time,
-                    'should_count': entry['counted']
-                }
-            
-            elif entry['state'] == 'exiting':  # Check grace period
-                exit_duration = (current_time - entry['exit_time']).total_seconds()
-                if exit_duration >= self.exit_grace_time:
-                    dwell_time = (entry['exit_time'] - entry['entry_time']).total_seconds()
-                    should_count = entry['counted']
-                    del tracker[person_id]
-                    return {
-                        'action': 'confirmed_exit',
-                        'dwell_time': dwell_time,
-                        'should_count': should_count
-                    }
-            
-            return {'action': 'outside', 'dwell_time': 0.0, 'should_count': False}
-
-    def cleanup_stale_tracks(self, camera_id: str, active_ids: Set[int]) -> None:
-        """Remove stale tracks for people no longer detected."""
-        current_time = datetime.datetime.now()
-        
-        # Clean state buffers
-        for zone, buffer in self.person_state_buffer.get(camera_id, {}).items():
-            stale = [
-                pid for pid, data in buffer.items()
-                if pid not in active_ids or
-                (current_time - data['last_update']) > datetime.timedelta(seconds=30)
-            ]
-            for pid in stale:
-                del buffer[pid]
-        
-        # Clean dwell trackers
-        for zone, tracker in self.person_dwell_tracker.get(camera_id, {}).items():
-            stale = []
-            for pid, data in tracker.items():
-                last_active = data.get('exit_time', data.get('last_seen'))
-                if last_active and (current_time - last_active) > datetime.timedelta(minutes=2):
-                    stale.append(pid)
-            for pid in stale:
-                del tracker[pid]
-
-    def reset_zone_counts(self, camera_id: str, zone: str) -> bool:
-        """Reset all counts and tracking for a zone."""
-        try:
-            if camera_id not in self.data or zone not in self.data[camera_id]["zones"]:
-                return False
-                
-            # Comprehensive reset of zone data
-            zone_data = self.data[camera_id]["zones"][zone]
-            zone_data["in_count"] = 0
-            zone_data["out_count"] = 0
-            zone_data["inside_ids"] = []
-            
-            # Clear tracking structures
-            if camera_id in self.inside_zones and zone in self.inside_zones[camera_id]:
-                self.inside_zones[camera_id][zone] = set()
-                
-            if camera_id in self.person_zone_history and zone in self.person_zone_history[camera_id]:
-                self.person_zone_history[camera_id][zone] = {}
-            
-            if zone in self.person_state_buffer.get(camera_id, {}):
-                self.person_state_buffer[camera_id][zone] = {}
-            if zone in self.person_dwell_tracker.get(camera_id, {}):
-                self.person_dwell_tracker[camera_id][zone] = {}
-            
-            self.save_data()
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to reset zone {zone}: {e}")
-            return False
-
-    def delete_zone(self, camera_id: str, zone: str) -> bool:
-        """Delete a zone from a specific camera."""
-        try:
-            if camera_id not in self.data or zone not in self.data[camera_id]["zones"]:
-                return False
-                
-            # Remove zone data
-            del self.data[camera_id]["zones"][zone]
-            
-            # Remove from all tracking structures
-            if camera_id in self.inside_zones and zone in self.inside_zones[camera_id]:
-                del self.inside_zones[camera_id][zone]
-                
-            if camera_id in self.person_zone_history and zone in self.person_zone_history[camera_id]:
-                del self.person_zone_history[camera_id][zone]
-                
-            if camera_id in self.person_state_buffer and zone in self.person_state_buffer[camera_id]:
-                del self.person_state_buffer[camera_id][zone]
-                
-            if camera_id in self.person_dwell_tracker and zone in self.person_dwell_tracker[camera_id]:
-                del self.person_dwell_tracker[camera_id][zone]
-                
-            self.save_data()
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to delete zone {zone}: {e}")
-            return False
-
-    def reset_line_counts(self, camera_id: str, line_name: str) -> bool:
-        try:
-            if camera_id not in self.lines or line_name not in self.lines[camera_id]:
-                return False
-            self.lines[camera_id][line_name]["in_count"] = 0
-            self.lines[camera_id][line_name]["out_count"] = 0
-            self.lines[camera_id][line_name]["history"] = []
-            self.line_cross_tracker[camera_id][line_name] = {}
-            self.save_data()
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to reset line {line_name}: {e}")
-            return False
-
-    def set_active_camera(self, camera_id: str) -> bool:
-        """Set the active camera for UI display."""
-        if camera_id in self.data:
-            self.active_camera = camera_id
-            print(f"[INFO] Active camera set to: {camera_id}")
-            return True
-        print(f"[WARNING] Camera {camera_id} not found in data")
-        return False
-
-    def create_or_update_line(self, camera_id: str, line_name: str, start: List[int], end: List[int]) -> bool:
-        """Create or update a directional line for crossing detection."""
-        try:
-            if camera_id not in self.lines:
-                self.lines[camera_id] = {}
-            if camera_id not in self.line_cross_tracker:
-                self.line_cross_tracker[camera_id] = {}
-
-            if camera_id not in self.line_cooldown_tracker:
-                self.line_cooldown_tracker[camera_id] = {}
-
-            self.lines[camera_id][line_name] = {
-                "start": start,
-                "end": end,
-                "in_count": 0,
-                "out_count": 0,
-                "history": []
-            }
-            self.line_cross_tracker[camera_id][line_name] = {}
-            self.line_cooldown_tracker[camera_id][line_name] = {}
-            self.save_data()
-            print(f"[INFO] Created/updated line '{line_name}' for camera '{camera_id}'")
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to create/update line {line_name}: {e}")
-            return False
-
-    def delete_line(self, camera_id: str, line_name: str) -> bool:
-        try:
-            if camera_id in self.lines and line_name in self.lines[camera_id]:
-                del self.lines[camera_id][line_name]
-            if camera_id in self.line_cross_tracker and line_name in self.line_cross_tracker[camera_id]:
-                del self.line_cross_tracker[camera_id][line_name]
-            self.save_data()
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to delete line {line_name}: {e}")
-            return False
-
-    def get_line_stats(self, camera_id: str, line_name: str) -> Optional[Dict[str, Any]]:
-        if camera_id in self.lines and line_name in self.lines[camera_id]:
-            return self.lines[camera_id][line_name]
-        return None
-
-    
-
-    '''def _check_intersection(self, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> Tuple[bool, int]:
-        
-        v1 = p2 - p1  # Movement vector of the person
-        v2 = p4 - p3  # The defined counting line vector
-
-        # Cross product to determine direction
-        # We only need the Z-component of the 2D cross product
-        cross_product_z = v1[0] * v2[1] - v1[1] * v2[0]
-
-        # Check for intersection using a standard line-segment intersection formula
-        t_num = np.cross(p3 - p1, v2)
-        u_num = np.cross(p3 - p1, v1)
-        denom = np.cross(v1, v2)
-
-        if denom == 0:  # Lines are parallel or collinear
-            return False, 0
-        
-        t = t_num / denom
-        u = u_num / denom
-
-        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
-            # Intersection occurs, return direction based on the sign of the denominator
-            # This gives a consistent "in" vs "out" regardless of line angle
-            return True, np.sign(denom)
-        
-        return False, 0'''
-    
-    """def update_line_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
-        try:
-            if camera_id not in self.lines:
-                return
-
-            for line_name, line_data in self.lines[camera_id].items():
-                if line_name not in self.line_cross_tracker[camera_id]:
-                    self.line_cross_tracker[camera_id][line_name] = {}
-
-                tracker = self.line_cross_tracker[camera_id][line_name]
-                p1 = np.array(line_data["start"])
-                p2 = np.array(line_data["end"])
-                line_vec = p2 - p1
-                line_norm = np.array([-line_vec[1], line_vec[0]])  # perpendicular for side checking
-
-                for person in detected_people:
-                    person_id, x, y = person
-                    current = np.array([x, y])
-                    prev = tracker.get(person_id)
-
-                    if prev is not None:
-                        # Determine which side of line each point is on
-                        side_prev = np.dot(prev - p1, line_norm)
-                        side_curr = np.dot(current - p1, line_norm)
-
-                        if side_prev * side_curr < 0:  # Crossed the line
-                            direction = "in" if side_curr > 0 else "out"
-                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                            if direction == "in":
-                                self.lines[camera_id][line_name]["in_count"] += 1
-                                self.lines[camera_id][line_name]["history"].append({
-                                    "id": person_id, "action": "In", "time": timestamp
-                                })
-                            else:
-                                self.lines[camera_id][line_name]["out_count"] += 1
-                                self.lines[camera_id][line_name]["history"].append({
-                                    "id": person_id, "action": "Out", "time": timestamp
-                                })
-
-                    tracker[person_id] = current
-
-            self.save_data()
-        except Exception as e:
-            print(f"[ERROR] Line counting failed for {camera_id}: {e}")"""
-
-    
-    # --- DELETE the entire _check_intersection function ---
-# def _check_intersection(self, ...):
-#     ...
-
-# --- ADD THIS NEW HELPER FUNCTION in its place ---
-    def _get_side_of_line(self, point: np.ndarray, line_start: np.ndarray, line_end: np.ndarray) -> int:
-        """
-        Determines which side of an infinitely long line a point is on.
-        
-        Returns:
-            -  1: If on one side (e.g., "right" or "IN" depending on line direction)
-            - -1: If on the other side (e.g., "left" or "OUT")
-            -  0: If the point is exactly on the line
-        """
-        line_vec = line_end - line_start
-        point_vec = point - line_start
-        # The Z-component of the 2D cross product gives the side
-        cross_product_z = line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0]
-        return np.sign(cross_product_z)
-
-    # --- REPLACE your entire old update_line_counts function with this new one ---
-
-    # --- REPLACE your entire old update_line_counts function with this new one ---
-
-    def update_line_counts(self, camera_id: str, detected_people: Set[Tuple]) -> None:
-        """
-        Update line crossing counts using a stateful, jitter-resistant method
-        that RESPECTS THE FINITE LINE SEGMENT.
-        """
-        try:
-            if camera_id not in self.lines:
-                return
-
-            current_time = datetime.datetime.now()
-            active_ids = {p[0] for p in detected_people}
-
-            for line_name, line_data in self.lines[camera_id].items():
-                # Ensure trackers exist
-                if line_name not in self.line_cross_tracker.get(camera_id, {}):
-                    self.line_cross_tracker[camera_id][line_name] = {}
-                if line_name not in self.line_cooldown_tracker.get(camera_id, {}):
-                    self.line_cooldown_tracker[camera_id][line_name] = {}
-
+    def _process_lines(self, camera_id: str, detected_people: Set[Tuple],
+                       current_time: datetime.datetime, active_ids: Set[int]) -> None:
+        for line_name, line_data in self.data[camera_id].get("lines", {}).items():
+            try:
                 tracker = self.line_cross_tracker[camera_id][line_name]
                 cooldown_tracker = self.line_cooldown_tracker[camera_id][line_name]
-                
                 p_line_start = np.array(line_data["start"])
                 p_line_end = np.array(line_data["end"])
 
-                # 1. Cleanup stale trackers and expired cooldowns
                 for person_id in list(tracker.keys()):
                     if person_id not in active_ids:
                         del tracker[person_id]
-                stale_cooldowns = [pid for pid, end_time in cooldown_tracker.items() if current_time > end_time]
+
+                stale_cooldowns = [pid for pid, end_time in cooldown_tracker.items()
+                                   if current_time > end_time]
                 for pid in stale_cooldowns:
                     del cooldown_tracker[pid]
 
-                # 2. Process each detected person
                 for person_data in detected_people:
                     person_id = person_data[0]
                     p_current = np.array(self._get_person_position(person_data, method="center"))
 
                     if person_id in cooldown_tracker:
-                        continue 
+                        continue
 
-                    # --- START OF THE CRITICAL FIX ---
-                    # 2A. Bounding Box Check: Is the person even near the line segment?
-                    # Create a bounding box around the line segment with a little padding.
                     line_x_coords = [p_line_start[0], p_line_end[0]]
                     line_y_coords = [p_line_start[1], p_line_end[1]]
-                    padding = 50 # pixels of padding around the line
+                    padding = 50
 
                     is_near_line = (min(line_x_coords) - padding <= p_current[0] <= max(line_x_coords) + padding) and \
-                                (min(line_y_coords) - padding <= p_current[1] <= max(line_y_coords) + padding)
+                                   (min(line_y_coords) - padding <= p_current[1] <= max(line_y_coords) + padding)
 
-                    # If the person is not near the line, we don't need to process them further.
-                    # If they were previously being tracked, we clear their state.
                     if not is_near_line:
                         if person_id in tracker:
-                            del tracker[person_id] 
+                            del tracker[person_id]
                         continue
-                    # --- END OF THE CRITICAL FIX ---
-                    
+
                     current_side = self._get_side_of_line(p_current, p_line_start, p_line_end)
                     if current_side == 0:
                         continue
-                    
-                    # Initialize tracking for a new person who IS near the line
+
                     if person_id not in tracker:
                         tracker[person_id] = {
-                            'position': p_current, 'side': current_side,
-                            'frames_on_side': 1, 'stable': False
+                            'position': p_current.copy(),
+                            'side': current_side,
+                            'frames_on_side': 1,
+                            'stable': False
                         }
                         continue
-                    
+
                     person_track = tracker[person_id]
-                    
                     displacement = np.linalg.norm(p_current - person_track['position'])
-                    if displacement < self.min_movement_threshold and person_track['stable']:
+
+                    if displacement < self.config.min_movement_threshold and person_track['stable']:
                         continue
 
-                    # If person has switched sides (and we know they are near the line)
                     if current_side != person_track['side']:
                         if person_track['stable']:
-                            timestamp_dt = datetime.datetime.now()
-                            timestamp_str = timestamp_dt.strftime("%Y-%m-%d %H:%M:%S")
-                            
-                            action = "in" if current_side > 0 else "out"
-                            
-                            if action == "in": line_data["in_count"] += 1
-                            else: line_data["out_count"] += 1
-                            
-                            line_data["history"].append({"id": person_id, "action": action.capitalize(), "time": timestamp_str})
-                            
-                            cooldown_end_time = timestamp_dt + datetime.timedelta(seconds=self.crossing_cooldown_seconds)
+                            timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
+                            action = ActionType.IN.value if current_side > 0 else ActionType.OUT.value
+
+                            if action == ActionType.IN.value:
+                                line_data["in_count"] += 1
+                            else:
+                                line_data["out_count"] += 1
+
+                            history_entry = {"id": person_id, "action": action, "time": timestamp_str}
+                            line_data["history"].append(history_entry)
+                            line_data["history"] = self._trim_history(line_data["history"])
+
+                            topic = f"vision/{self.pi_id}/{camera_id}/history/line/cross"
+                            payload = {"line": line_name, **history_entry}
+                            self._publish_mqtt_event(topic, payload)
+
+                            if self.db_enabled and self.db_writer:
+                                try:
+                                    self.db_writer.write_line_crossing(
+                                        camera_id=camera_id,
+                                        line_name=line_name,
+                                        person_id=person_id,
+                                        direction=action,
+                                        pi_id=self.pi_id
+                                    )
+
+                                    try:
+                                        from pi_status_monitor import get_status_monitor
+                                        status_monitor = get_status_monitor(self.pi_id)
+                                        status_monitor.increment_event_count()
+                                    except:
+                                        pass
+                                        
+                                except Exception as e:
+                                    logger.error(f"Failed to write line crossing event to DB: {e}")
+
+                            cooldown_end_time = current_time + datetime.timedelta(
+                                seconds=self.config.crossing_cooldown_seconds)
                             cooldown_tracker[person_id] = cooldown_end_time
+
                             del tracker[person_id]
                             continue
                         else:
-                            person_track.update({'side': current_side, 'frames_on_side': 1, 'stable': False})
+                            person_track.update({
+                                'side': current_side,
+                                'frames_on_side': 1,
+                                'stable': False
+                            })
                     else:
                         person_track['frames_on_side'] += 1
-                        if not person_track['stable'] and person_track['frames_on_side'] >= self.state_confirmation_frames:
+                        if (not person_track['stable'] and
+                                person_track['frames_on_side'] >= self.config.state_confirmation_frames):
                             person_track['stable'] = True
 
-                    person_track['position'] = p_current
+                    person_track['position'] = p_current.copy()
 
-            self.save_data()
+            except Exception as e:
+                logger.error(f"Error processing line {line_name}: {e}")
+
+    def _perform_cleanup(self) -> None:
+        try:
+            current_time = datetime.datetime.now()
+            cleanup_threshold = datetime.timedelta(minutes=30)
+
+            for camera_id in self.data.keys():
+                for zone, buffer in self.person_state_buffer.get(camera_id, {}).items():
+                    stale_ids = [
+                        pid for pid, data in buffer.items()
+                        if (current_time - data['last_update']) > cleanup_threshold
+                    ]
+                    for pid in stale_ids:
+                        del buffer[pid]
+
+                for zone, tracker in self.person_dwell_tracker.get(camera_id, {}).items():
+                    stale_ids = []
+                    for pid, data in tracker.items():
+                        last_active = data.get('exit_time', data.get('last_seen'))
+                        if last_active and (current_time - last_active) > cleanup_threshold:
+                            stale_ids.append(pid)
+                    for pid in stale_ids:
+                        del tracker[pid]
+
+            logger.info("Performed periodic cleanup")
+
         except Exception as e:
-            print(f"[ERROR] Line counting failed for {camera_id}: {e}")
+            logger.error(f"Error during cleanup: {e}")
 
     def create_or_update_zone(self, camera_id: str, zone: str,
-                            top_left: List[int], bottom_right: List[int]) -> bool:
-        """Create or update a zone configuration."""
-        try:
-            # Validate coordinates
-            x1, y1 = map(int, top_left)
-            x2, y2 = map(int, bottom_right)
-            if x1 >= x2 or y1 >= y2:
-                print(f"[ERROR] Invalid coordinates for zone {zone}: top_left must be less than bottom_right")
-                return False
-                
-            # Initialize camera if new
-            if camera_id not in self.data:
-                self.data[camera_id] = {"zones": {}}
-                self._init_camera(camera_id)
-                print(f"[INFO] Initialized new camera: {camera_id}")
-            
-            # Create/update zone
-            self.data[camera_id]["zones"][zone] = {
-                "top_left": [x1, y1],
-                "bottom_right": [x2, y2],
-                "in_count": 0,
-                "out_count": 0,
-                "inside_ids": [],
-                "history": []
-            }
-            
-            # Initialize tracking structures if they don't exist
-            if camera_id not in self.inside_zones:
-                self.inside_zones[camera_id] = {}
-            if camera_id not in self.person_zone_history:
-                self.person_zone_history[camera_id] = {}
-            if camera_id not in self.person_state_buffer:
-                self.person_state_buffer[camera_id] = {}
-            if camera_id not in self.person_dwell_tracker:
-                self.person_dwell_tracker[camera_id] = {}
-            
-            # Initialize zone-specific tracking
-            self.inside_zones[camera_id][zone] = set()
-            self.person_zone_history[camera_id][zone] = {}
-            self.person_state_buffer[camera_id][zone] = {}
-            self.person_dwell_tracker[camera_id][zone] = {}
-            
-            self.save_data()
-            print(f"[INFO] Created/updated zone '{zone}' for camera '{camera_id}'")
-            return True
-        except Exception as e:
-            print(f"[ERROR] Failed to create/update zone {zone}: {e}")
+                              top_left: List[int], bottom_right: List[int]) -> bool:
+        if not self._validate_coordinates(top_left, bottom_right):
+            logger.error(f"Invalid coordinates for zone {zone}: {top_left} -> {bottom_right}")
             return False
 
+        with self.lock:
+            try:
+                if camera_id not in self.data:
+                    self.data[camera_id] = {"zones": {}, "lines": {}}
+                    self._init_camera(camera_id)
+                else:
+                    if camera_id not in self.inside_zones:
+                        self.inside_zones[camera_id] = defaultdict(set)
+                    if camera_id not in self.person_state_buffer:
+                        self.person_state_buffer[camera_id] = defaultdict(dict)
+
+                    self.inside_zones[camera_id][zone] = set()
+                    self.person_state_buffer[camera_id][zone] = {}
+                    self.person_dwell_tracker[camera_id][zone] = {}
+                    self.person_zone_history[camera_id][zone] = {}
+
+                self.data[camera_id]["zones"][zone] = {
+                    "top_left": top_left,
+                    "bottom_right": bottom_right,
+                    "in_count": 0,
+                    "out_count": 0,
+                    "inside_ids": [],
+                    "history": []
+                }
+                #self._init_camera(camera_id)
+                save_zone_line_config(self)
+                logger.info(f"Created/updated zone '{zone}' for camera '{camera_id}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to create/update zone {zone}: {e}")
+                return False
+
+    def delete_zone(self, camera_id: str, zone: str) -> bool:
+        with self.lock:
+            try:
+                if camera_id not in self.data or zone not in self.data[camera_id].get("zones", {}):
+                    logger.warning(f"Zone {zone} not found in camera {camera_id}")
+                    return False
+
+                del self.data[camera_id]["zones"][zone]
+
+                if camera_id in self.inside_zones and zone in self.inside_zones[camera_id]:
+                    del self.inside_zones[camera_id][zone]
+                if camera_id in self.person_state_buffer and zone in self.person_state_buffer[camera_id]:
+                    del self.person_state_buffer[camera_id][zone]
+                if camera_id in self.person_dwell_tracker and zone in self.person_dwell_tracker[camera_id]:
+                    del self.person_dwell_tracker[camera_id][zone]
+                if camera_id in self.person_zone_history and zone in self.person_zone_history[camera_id]:
+                    del self.person_zone_history[camera_id][zone]
+
+                save_zone_line_config(self)
+
+                logger.info(f"Deleted zone '{zone}' from camera '{camera_id}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to delete zone {zone}: {e}")
+                return False
+
+    def reset_zone_counts(self, camera_id: str, zone: str) -> bool:
+        with self.lock:
+            try:
+                if camera_id not in self.data or zone not in self.data[camera_id].get("zones", {}):
+                    logger.warning(f"Zone {zone} not found in camera {camera_id}")
+                    return False
+
+                zone_data = self.data[camera_id]["zones"][zone]
+                zone_data.update({
+                    "in_count": 0,
+                    "out_count": 0,
+                    "history": [],
+                    "inside_ids": []
+                })
+
+                if camera_id in self.inside_zones and zone in self.inside_zones[camera_id]:
+                    self.inside_zones[camera_id][zone].clear()
+                if camera_id in self.person_state_buffer and zone in self.person_state_buffer[camera_id]:
+                    self.person_state_buffer[camera_id][zone].clear()
+                if camera_id in self.person_dwell_tracker and zone in self.person_dwell_tracker[camera_id]:
+                    self.person_dwell_tracker[camera_id][zone].clear()
+                if camera_id in self.person_zone_history and zone in self.person_zone_history[camera_id]:
+                    self.person_zone_history[camera_id][zone].clear()
+
+                logger.info(f"Reset counts for zone '{zone}' in camera '{camera_id}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to reset zone {zone}: {e}")
+                return False
+
     def get_zone_stats(self, camera_id: str, zone: str) -> Optional[Dict[str, Any]]:
-        """Get current statistics for a zone."""
         try:
-            if camera_id not in self.data or zone not in self.data[camera_id]["zones"]:
+            if (camera_id not in self.data or
+                    zone not in self.data[camera_id].get("zones", {})):
                 return None
-                
+
             zone_data = self.data[camera_id]["zones"][zone]
             current_inside = self.inside_zones.get(camera_id, {}).get(zone, set())
-            
-            # Calculate dwell statistics
-            dwell_stats = {"active": 0, "avg_dwell": 0.0, "max_dwell": 0.0, "qualified": 0}
-            if zone in self.person_dwell_tracker.get(camera_id, {}):
+
+            dwell_stats = {
+                "active_people": 0,
+                "avg_dwell_time": 0.0,
+                "max_dwell_time": 0.0,
+                "qualified_entries": 0
+            }
+
+            if (camera_id in self.person_dwell_tracker and
+                    zone in self.person_dwell_tracker[camera_id]):
                 now = datetime.datetime.now()
                 dwell_times = []
-                
+
                 for pid, data in self.person_dwell_tracker[camera_id][zone].items():
-                    if data['state'] == 'inside':
+                    if data['state'] == PersonState.INSIDE.value:
                         dwell_time = (now - data['entry_time']).total_seconds()
                         dwell_times.append(dwell_time)
-                        dwell_stats["active"] += 1
+                        dwell_stats["active_people"] += 1
                         if data['counted']:
-                            dwell_stats["qualified"] += 1
-                
+                            dwell_stats["qualified_entries"] += 1
+
                 if dwell_times:
-                    dwell_stats["avg_dwell"] = sum(dwell_times) / len(dwell_times)
-                    dwell_stats["max_dwell"] = max(dwell_times)
-            
+                    dwell_stats["avg_dwell_time"] = sum(dwell_times) / len(dwell_times)
+                    dwell_stats["max_dwell_time"] = max(dwell_times)
+
             return {
                 "in_count": zone_data["in_count"],
                 "out_count": zone_data["out_count"],
+                "net_count": zone_data["in_count"] - zone_data["out_count"],
                 "current_occupancy": len(current_inside),
                 "inside_ids": list(current_inside),
                 "dwell_stats": dwell_stats,
                 "coordinates": {
                     "top_left": zone_data["top_left"],
                     "bottom_right": zone_data["bottom_right"]
-                }
+                },
+                "recent_history": zone_data["history"][-10:]
             }
         except Exception as e:
-            print(f"[ERROR] Failed to get stats for {zone}: {e}")
+            logger.error(f"Failed to get stats for zone {zone}: {e}")
             return None
 
-    def _process_entries(self, camera_id: str, zone: str, newly_entered: Set[int], 
-                        timestamp: datetime.datetime, timestamp_str: str) -> Set[int]:
-        """Process newly entered people and update counts - for compatibility."""
-        real_new_entries = set()
-        for p_id in newly_entered:
-            # Check if this person hasn't recently been counted
-            person_history = self.person_zone_history[camera_id][zone].get(p_id, {})
-            if not person_history or person_history.get('last_action') != 'entered':
-                real_new_entries.add(p_id)
-                # Update person's zone history
-                self.person_zone_history[camera_id][zone][p_id] = {
-                    'last_action': 'entered',
-                    'last_action_time': timestamp
+    def create_or_update_line(self, camera_id: str, line_name: str,
+                              start: List[int], end: List[int]) -> bool:
+        if not self._validate_line_coordinates(start, end):
+            logger.error(f"Invalid coordinates for line {line_name}: {start} -> {end}")
+            return False
+
+        with self.lock:
+            try:
+                if camera_id not in self.data:
+                    self.data[camera_id] = {"zones": {}, "lines": {}}
+
+                if "lines" not in self.data[camera_id]:
+                    self.data[camera_id]["lines"] = {}
+
+                self.data[camera_id]["lines"][line_name] = {
+                    "start": start,
+                    "end": end,
+                    "in_count": 0,
+                    "out_count": 0,
+                    "history": []
                 }
-        
-        # Update count and log only real new entries
-        if real_new_entries:
-            self.data[camera_id]["zones"][zone]["in_count"] += len(real_new_entries)
-            for p_id in real_new_entries:
-                self.data[camera_id]["zones"][zone]["history"].append({
-                    "id": p_id, 
-                    "action": "Entered", 
-                    "time": timestamp_str
+                self._init_camera(camera_id)
+
+                save_zone_line_config(self)
+
+                logger.info(f"Created/updated line '{line_name}' for camera '{camera_id}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to create/update line {line_name}: {e}")
+                return False
+
+    def delete_line(self, camera_id: str, line_name: str) -> bool:
+        with self.lock:
+            try:
+                if (camera_id not in self.data or
+                        line_name not in self.data[camera_id].get("lines", {})):
+                    logger.warning(f"Line {line_name} not found in camera {camera_id}")
+                    return False
+
+                del self.data[camera_id]["lines"][line_name]
+
+                if (camera_id in self.line_cross_tracker and
+                        line_name in self.line_cross_tracker[camera_id]):
+                    del self.line_cross_tracker[camera_id][line_name]
+                if (camera_id in self.line_cooldown_tracker and
+                        line_name in self.line_cooldown_tracker[camera_id]):
+                    del self.line_cooldown_tracker[camera_id][line_name]
+
+                save_zone_line_config(self)
+
+                logger.info(f"Deleted line '{line_name}' from camera '{camera_id}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to delete line {line_name}: {e}")
+                return False
+
+    def reset_line_counts(self, camera_id: str, line_name: str) -> bool:
+        with self.lock:
+            try:
+                if (camera_id not in self.data or
+                        line_name not in self.data[camera_id].get("lines", {})):
+                    logger.warning(f"Line {line_name} not found in camera {camera_id}")
+                    return False
+
+                line_data = self.data[camera_id]["lines"][line_name]
+                line_data.update({
+                    "in_count": 0,
+                    "out_count": 0,
+                    "history": []
                 })
-        
-        return real_new_entries
+
+                if (camera_id in self.line_cross_tracker and
+                        line_name in self.line_cross_tracker[camera_id]):
+                    self.line_cross_tracker[camera_id][line_name].clear()
+                if (camera_id in self.line_cooldown_tracker and
+                        line_name in self.line_cooldown_tracker[camera_id]):
+                    self.line_cooldown_tracker[camera_id][line_name].clear()
+
+                
+                logger.info(f"Reset counts for line '{line_name}' in camera '{camera_id}'")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to reset line {line_name}: {e}")
+                return False
+
+    def get_line_stats(self, camera_id: str, line_name: str) -> Optional[Dict[str, Any]]:
+        try:
+            if (camera_id not in self.data or
+                    line_name not in self.data[camera_id].get("lines", {})):
+                return None
+
+            line_data = self.data[camera_id]["lines"][line_name]
+
+            active_tracks = 0
+            if (camera_id in self.line_cross_tracker and
+                    line_name in self.line_cross_tracker[camera_id]):
+                active_tracks = len(self.line_cross_tracker[camera_id][line_name])
+
+            return {
+                "in_count": line_data["in_count"],
+                "out_count": line_data["out_count"],
+                "net_count": line_data["in_count"] - line_data["out_count"],
+                "active_tracks": active_tracks,
+                "coordinates": {
+                    "start": line_data["start"],
+                    "end": line_data["end"]
+                },
+                "recent_history": line_data["history"][-10:]
+            }
+        except Exception as e:
+            logger.error(f"Failed to get stats for line {line_name}: {e}")
+            return None
 
     def get_all_lines(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """Return all lines for all cameras."""
-        return self.lines
+        with self.lock:
+            result = {}
+            for camera_id in self.data.keys():
+                if "lines" in self.data[camera_id]:
+                    result[camera_id] = self.data[camera_id]["lines"]
+            return result
 
-    def _process_exits(self, camera_id: str, zone: str, newly_exited: Set[int], 
-                      timestamp: datetime.datetime, timestamp_str: str) -> Set[int]:
-        """Process newly exited people and update counts - for compatibility."""
-        real_new_exits = set()
-        for p_id in newly_exited:
-            # Check if this person hasn't recently been counted as exited
-            person_history = self.person_zone_history[camera_id][zone].get(p_id, {})
-            if not person_history or person_history.get('last_action') != 'exited':
-                real_new_exits.add(p_id)
-                # Update person's zone history
-                self.person_zone_history[camera_id][zone][p_id] = {
-                    'last_action': 'exited',
-                    'last_action_time': timestamp
+    def set_active_camera(self, camera_id: str) -> bool:
+        with self.lock:
+            if camera_id in self.data:
+                self.active_camera = camera_id
+                logger.info(f"Active camera set to: {camera_id}")
+                return True
+            else:
+                logger.warning(f"Camera {camera_id} not found")
+                return False
+
+    def get_camera_summary(self, camera_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            if camera_id not in self.data:
+                return None
+
+            zones_summary = {}
+            for zone_name in self.data[camera_id].get("zones", {}):
+                stats = self.get_zone_stats(camera_id, zone_name)
+                if stats:
+                    zones_summary[zone_name] = {
+                        "occupancy": stats["current_occupancy"],
+                        "total_entries": stats["in_count"],
+                        "total_exits": stats["out_count"]
+                    }
+
+            lines_summary = {}
+            for line_name in self.data[camera_id].get("lines", {}):
+                stats = self.get_line_stats(camera_id, line_name)
+                if stats:
+                    lines_summary[line_name] = {
+                        "crossings_in": stats["in_count"],
+                        "crossings_out": stats["out_count"],
+                        "net_flow": stats["net_count"]
+                    }
+
+            return {
+                "camera_id": camera_id,
+                "zones": zones_summary,
+                "lines": lines_summary,
+                "total_zones": len(self.data[camera_id].get("zones", {})),
+                "total_lines": len(self.data[camera_id].get("lines", {}))
+            }
+        except Exception as e:
+            logger.error(f"Failed to get camera summary for {camera_id}: {e}")
+            return None
+
+    def get_all_cameras_summary(self) -> Dict[str, Any]:
+        with self.lock:
+            summaries = {}
+            for camera_id in self.data.keys():
+                summary = self.get_camera_summary(camera_id)
+                if summary:
+                    summaries[camera_id] = summary
+
+            return {
+                "cameras": summaries,
+                "active_camera": self.active_camera,
+                "total_cameras": len(summaries)
+            }
+
+    def cleanup_stale_tracks(self, camera_id: str, active_ids: Set[int]) -> None:
+        try:
+            current_time = datetime.datetime.now()
+            stale_threshold = datetime.timedelta(seconds=30)
+
+            for zone, buffer in self.person_state_buffer.get(camera_id, {}).items():
+                stale_ids = [
+                    pid for pid, data in buffer.items()
+                    if pid not in active_ids or
+                    (current_time - data['last_update']) > stale_threshold
+                ]
+                for pid in stale_ids:
+                    del buffer[pid]
+
+            for zone, tracker in self.person_dwell_tracker.get(camera_id, {}).items():
+                stale_ids = []
+                for pid, data in tracker.items():
+                    if pid not in active_ids:
+                        if data['state'] == PersonState.INSIDE.value:
+                            data.update({
+                                'state': PersonState.EXITING.value,
+                                'exit_time': current_time
+                            })
+                        elif data['state'] == PersonState.EXITING.value:
+                            exit_duration = (current_time - data['exit_time']).total_seconds()
+                            if exit_duration >= self.config.exit_grace_time:
+                                stale_ids.append(pid)
+                    else:
+                        last_active = data.get('exit_time', data.get('last_seen'))
+                        if last_active and (current_time - last_active) > datetime.timedelta(minutes=5):
+                            stale_ids.append(pid)
+
+                for pid in stale_ids:
+                    del tracker[pid]
+
+        except Exception as e:
+            logger.error(f"Error during stale track cleanup: {e}")
+
+    def export_data(self, camera_id: Optional[str] = None,
+                      start_time: Optional[datetime.datetime] = None,
+                      end_time: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+        try:
+            with self.lock:
+                export_data = {}
+
+                cameras_to_export = [camera_id] if camera_id else list(self.data.keys())
+
+                for cam_id in cameras_to_export:
+                    if cam_id not in self.data:
+                        continue
+
+                    cam_data = self.data[cam_id].copy()
+
+                    if start_time or end_time:
+                        for zone_data in cam_data.get("zones", {}).values():
+                            filtered_history = []
+                            for entry in zone_data.get("history", []):
+                                try:
+                                    entry_time = datetime.datetime.strptime(
+                                        entry["time"], "%Y-%m-%d %H:%M:%S")
+                                    if start_time and entry_time < start_time:
+                                        continue
+                                    if end_time and entry_time > end_time:
+                                        continue
+                                    filtered_history.append(entry)
+                                except (ValueError, KeyError):
+                                    continue
+                            zone_data["history"] = filtered_history
+
+                        for line_data in cam_data.get("lines", {}).values():
+                            filtered_history = []
+                            for entry in line_data.get("history", []):
+                                try:
+                                    entry_time = datetime.datetime.strptime(
+                                        entry["time"], "%Y-%m-%d %H:%M:%S")
+                                    if start_time and entry_time < start_time:
+                                        continue
+                                    if end_time and entry_time > end_time:
+                                        continue
+                                    filtered_history.append(entry)
+                                except (ValueError, KeyError):
+                                    continue
+                            line_data["history"] = filtered_history
+
+                    export_data[cam_id] = cam_data
+
+                return {
+                    "export_timestamp": datetime.datetime.now().isoformat(),
+                    "cameras": export_data,
+                    "config": {
+                        "frame_height": self.config.frame_height,
+                        "frame_width": self.config.frame_width,
+                        "zone_padding": self.config.zone_padding,
+                        "min_dwell_time": self.config.min_dwell_time
+                    }
                 }
-        
-        # Update count and log only real new exits
-        if real_new_exits:
-            self.data[camera_id]["zones"][zone]["out_count"] += len(real_new_exits)
-            for p_id in real_new_exits:
-                self.data[camera_id]["zones"][zone]["history"].append({
-                    "id": p_id, 
-                    "action": "Exited", 
-                    "time": timestamp_str
-                })
-        
-        return real_new_exits
+        except Exception as e:
+            logger.error(f"Failed to export data: {e}")
+            return {}
+
+    def get_system_status(self) -> Dict[str, Any]:
+        try:
+            with self.lock:
+                total_zones = sum(len(cam_data.get("zones", {}))
+                                  for cam_data in self.data.values())
+                total_lines = sum(len(cam_data.get("lines", {}))
+                                  for cam_data in self.data.values())
+
+                active_zone_tracks = 0
+                active_line_tracks = 0
+
+                for cam_id in self.data.keys():
+                    for zone_tracker in self.person_dwell_tracker.get(cam_id, {}).values():
+                        active_zone_tracks += len(zone_tracker)
+                    for line_tracker in self.line_cross_tracker.get(cam_id, {}).values():
+                        active_line_tracks += len(line_tracker)
+
+                return {
+                    "status": "operational",
+                    "cameras": {
+                        "total": len(self.data),
+                        "active": self.active_camera,
+                        "list": list(self.data.keys())
+                    },
+                    "zones": {
+                        "total": total_zones,
+                        "active_tracks": active_zone_tracks
+                    },
+                    "lines": {
+                        "total": total_lines,
+                        "active_tracks": active_line_tracks
+                    },
+                    "last_cleanup": self.last_cleanup.isoformat(),
+                    "uptime": datetime.datetime.now().isoformat()
+                }
+        except Exception as e:
+            logger.error(f"Failed to get system status: {e}")
+            return {"status": "error", "message": str(e)}
